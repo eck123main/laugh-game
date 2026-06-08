@@ -1,76 +1,15 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <link rel="stylesheet" href="style.css">
-
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>deadpan</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<!-- MediaPipe Face Mesh -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
 <script src="/socket.io/socket.io.js"></script>
-<style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  :root {
-    --bg: #0a0a0a; --surface: #111; --border: #222;
-    --text: #f0ece4; --muted: #555; --accent: #c8f04a; --danger: #ff4444;
-    --mono: 'Space Mono', monospace; --sans: 'Syne', sans-serif;
-  }
-  body { background: var(--bg); color: var(--text); font-family: var(--sans); min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; overflow: hidden; }
-  .screen { display: none; width: 100%; max-width: 700px; padding: 2rem; animation: fadeIn 0.3s ease; }
-  .screen.active { display: flex; flex-direction: column; align-items: center; }
-  @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-  .logo { font-size: 64px; font-weight: 800; letter-spacing: -4px; color: var(--text); line-height: 1; margin-bottom: 6px; }
-  .logo span { color: var(--accent); }
-  .tagline { font-family: var(--mono); font-size: 11px; color: var(--muted); letter-spacing: 3px; text-transform: uppercase; margin-bottom: 3rem; }
-  .lobby-actions { display: flex; flex-direction: column; gap: 12px; width: 100%; max-width: 340px; }
-  .btn { width: 100%; padding: 14px 24px; border: 1px solid var(--border); background: transparent; color: var(--text); font-family: var(--mono); font-size: 13px; letter-spacing: 1px; cursor: pointer; transition: all 0.15s; text-transform: uppercase; }
-  .btn:hover { background: var(--surface); border-color: var(--muted); }
-  .btn.primary { background: var(--accent); color: #000; border-color: var(--accent); font-weight: 700; }
-  .btn.primary:hover { background: #d4f55a; }
-  .btn.danger { border-color: var(--danger); color: var(--danger); }
-  .btn.danger:hover { background: rgba(255,68,68,0.1); }
-  .room-code-display { font-family: var(--mono); font-size: 32px; font-weight: 700; letter-spacing: 8px; color: var(--accent); text-align: center; border: 1px solid var(--border); padding: 20px 30px; margin: 1.5rem 0; background: var(--surface); }
-  .waiting-dots span { display: inline-block; width: 6px; height: 6px; background: var(--muted); border-radius: 50%; margin: 0 3px; animation: blink 1.2s infinite; }
-  .waiting-dots span:nth-child(2) { animation-delay: 0.2s; }
-  .waiting-dots span:nth-child(3) { animation-delay: 0.4s; }
-  @keyframes blink { 0%,80%,100% { opacity: 0.2; } 40% { opacity: 1; } }
-  .input-row { display: flex; gap: 8px; width: 100%; max-width: 340px; margin-bottom: 1rem; }
-  input[type="text"] { flex: 1; padding: 14px; background: var(--surface); border: 1px solid var(--border); color: var(--text); font-family: var(--mono); font-size: 16px; letter-spacing: 4px; text-transform: uppercase; outline: none; text-align: center; }
-  input[type="text"]:focus { border-color: var(--accent); }
-  input[type="text"]::placeholder { letter-spacing: 2px; color: var(--muted); font-size: 12px; }
-  #screen-game { padding: 1rem; gap: 0; }
-  .game-header { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 0 0 12px; border-bottom: 1px solid var(--border); margin-bottom: 12px; }
-  .round-label { font-family: var(--mono); font-size: 11px; color: var(--muted); letter-spacing: 2px; text-transform: uppercase; }
-  .score-display { font-family: var(--mono); font-size: 18px; font-weight: 700; }
-  .score-display .you { color: var(--accent); }
-  .score-display .sep { color: var(--muted); margin: 0 6px; }
-  .timer-display { font-family: var(--mono); font-size: 28px; font-weight: 700; color: var(--text); letter-spacing: 2px; min-width: 70px; text-align: center; }
-  .timer-display.danger { color: var(--danger); animation: pulse 0.5s infinite; }
-  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
-  .cams { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; width: 100%; margin-bottom: 10px; }
-  .cam-wrap { position: relative; background: #000; aspect-ratio: 4/3; overflow: hidden; border: 1px solid var(--border); }
-  .cam-wrap video { width: 100%; height: 100%; object-fit: cover; display: block; }
-  .cam-label { position: absolute; bottom: 8px; left: 8px; font-family: var(--mono); font-size: 10px; letter-spacing: 2px; background: rgba(0,0,0,0.7); padding: 3px 8px; text-transform: uppercase; color: var(--muted); }
-  .cam-label.you { color: var(--accent); }
-  .cam-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 48px; background: var(--surface); transition: opacity 0.3s; }
-  .status-line { font-family: var(--mono); font-size: 12px; color: var(--muted); text-align: center; letter-spacing: 1px; margin-bottom: 10px; min-height: 18px; }
-  .status-line.highlight { color: var(--accent); }
-  .laugh-btn { width: 100%; padding: 18px; background: transparent; border: 1px solid var(--border); color: var(--muted); font-family: var(--mono); font-size: 13px; letter-spacing: 2px; cursor: pointer; transition: all 0.15s; text-transform: uppercase; margin-bottom: 8px; }
-  .laugh-btn:hover { border-color: var(--danger); color: var(--danger); background: rgba(255,68,68,0.05); }
-  .laugh-btn:active { transform: scale(0.98); }
-  .laugh-btn:disabled { opacity: 0.3; cursor: not-allowed; pointer-events: none; }
-  .result-emoji { font-size: 80px; margin-bottom: 1rem; }
-  .result-title { font-size: 48px; font-weight: 800; letter-spacing: -2px; margin-bottom: 8px; }
-  .result-title.win { color: var(--accent); }
-  .result-title.lose { color: var(--danger); }
-  .result-sub { font-family: var(--mono); font-size: 12px; color: var(--muted); letter-spacing: 2px; text-transform: uppercase; margin-bottom: 2rem; }
-  .final-score { font-family: var(--mono); font-size: 32px; margin-bottom: 2rem; }
-  .final-score .accent { color: var(--accent); }
-  .small-note { font-family: var(--mono); font-size: 10px; color: var(--muted); text-align: center; margin-top: 1rem; letter-spacing: 1px; line-height: 1.8; }
-  .divider { width: 100%; height: 1px; background: var(--border); margin: 1.5rem 0; }
-  .live-dot { display: inline-block; width: 6px; height: 6px; background: var(--danger); border-radius: 50%; margin-right: 6px; animation: blink 1s infinite; }
-  .error-msg { font-family: var(--mono); font-size: 12px; color: var(--danger); text-align: center; margin-top: 8px; min-height: 18px; letter-spacing: 1px; }
-</style>
 </head>
 <body>
 
@@ -108,6 +47,7 @@
       <span class="you" id="score-you">0</span><span class="sep">–</span><span id="score-them">0</span>
     </div>
   </div>
+
   <div class="cams">
     <div class="cam-wrap">
       <video id="video-local" autoplay muted playsinline></video>
@@ -120,8 +60,36 @@
       <div class="cam-label">opponent</div>
     </div>
   </div>
+
+  <!-- Calibration message -->
+  <div id="calibration-msg" style="display:none; font-family:var(--mono); font-size:11px; color:var(--accent); text-align:center; letter-spacing:2px; text-transform:uppercase; margin-bottom:8px; padding:10px; border:1px solid var(--accent); background:rgba(200,240,74,0.05);">
+    😐 &nbsp; hold a neutral expression &nbsp; calibrating...
+  </div>
+
+  <!-- Mouth openness indicator bar -->
+  <div id="detection-bar" style="width:100%; margin-bottom:8px;">
+    <div style="font-family:var(--mono);font-size:9px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-bottom:4px;display:flex;justify-content:space-between;">
+      <span>mouth</span>
+      <span>sensitivity: 
+        <select onchange="setSensitivity(this.value)" style="background:var(--surface);color:var(--text);border:1px solid var(--border);font-family:var(--mono);font-size:9px;padding:1px 4px;">
+          <option value="0.6">high</option>
+          <option value="1.0" selected>medium</option>
+          <option value="1.5">low</option>
+        </select>
+      </span>
+    </div>
+    <div style="width:100%;height:4px;background:var(--border);border-radius:2px;overflow:hidden;">
+      <div id="mouth-indicator" style="height:100%;width:0%;background:var(--accent);border-radius:2px;transition:width 0.05s,background 0.1s;"></div>
+    </div>
+  </div>
+
   <div class="status-line" id="status-line">get ready...</div>
-  <button class="laugh-btn" id="laugh-btn" onclick="iLaughed()" disabled>😂 &nbsp; i laughed &nbsp; (you lose the round)</button>
+
+  <!-- Manual fallback button (hidden when AI detection works) -->
+  <button class="laugh-btn" id="laugh-btn" onclick="iLaughed()" disabled style="display:none;">
+    😂 &nbsp; i laughed &nbsp; (manual override)
+  </button>
+
   <button class="btn danger" onclick="leaveGame()" style="opacity:0.5;font-size:11px;padding:10px;">leave game</button>
 </div>
 
