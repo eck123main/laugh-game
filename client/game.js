@@ -384,7 +384,6 @@ async function resetGame() {
   updateScores();
 
   if (pc) { pc.close(); pc = null; }
-  await setupPeerConnection();
 
   const rv = document.getElementById('video-remote');
   rv.srcObject = null;
@@ -393,12 +392,17 @@ async function resetGame() {
 
   showScreen('game');
   document.getElementById('timer').classList.remove('danger');
+  beginPrepPhase();
+
+  // Give both sides time to rebuild pc before signaling
+  await new Promise(res => setTimeout(res, 800));
+
+  await setupPeerConnection();
 
   if (isHost) {
-    beginPrepPhase();
+    // Host waits for guest_ready, nothing to do
   } else {
     socket.emit('game_event', { code: roomCode, type: 'guest_ready' });
-    beginPrepPhase();
   }
 }
 
