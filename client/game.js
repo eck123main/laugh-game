@@ -127,14 +127,34 @@ socket.on('opponent_left', () => {
 // ─── WebRTC ───────────────────────────────────────────────
 async function setupPeerConnection() {
   pc = new RTCPeerConnection(RTC_CONFIG);
-  if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  
+  // Make sure we have a stream before adding tracks
+  if (localStream) {
+    localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  } else {
+    console.error('No local stream when setting up peer connection!');
+  }
+
   pc.ontrack = (e) => {
+    console.log('Got remote track!', e.streams);
     const v = document.getElementById('video-remote');
     v.srcObject = e.streams[0];
     v.onloadedmetadata = () => hideOverlay('overlay-remote');
+    // Force play
+    v.play().catch(err => console.warn('Video play failed:', err));
   };
+
   pc.onicecandidate = (e) => {
+    console.log('ICE candidate:', e.candidate);
     socket.emit('game_event', { code: roomCode, type: 'ice', data: e.candidate });
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    console.log('ICE state:', pc.iceConnectionState);
+  };
+
+  pc.onconnectionstatechange = () => {
+    console.log('Connection state:', pc.connectionState);
   };
 }
 
