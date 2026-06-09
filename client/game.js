@@ -31,7 +31,7 @@ let timerInterval = null;
 let timerSecs = 0;
 let scoreYou = 0, scoreThem = 0;
 let roundActive = false;
-let rematchVotes = 0;
+let iRequestedRematch = false;
 
 // Detection state
 let faceMesh = null;
@@ -102,17 +102,20 @@ socket.on('game_event', async ({ type, data }) => {
     case 'i_laughed':
       endRound(true);
       break;
-    case 'rematch_request':
-      rematchVotes++;
-      if (rematchVotes >= 2) {
-        socket.emit('game_event', { code: roomCode, type: 'rematch_go' });
+    case 'rematch_request': {
+      const btn = document.getElementById('next-btn');
+      if (iRequestedRematch) {
+        // Both sides ready — I already clicked, now they clicked
+        iRequestedRematch = false;
         resetGame();
       } else {
-        const btn = document.getElementById('next-btn');
-        btn.disabled = true;
-        btn.textContent = 'opponent wants a rematch...';
+        // They clicked first, update button so I can confirm
+        btn.disabled = false;
+        btn.textContent = 'opponent wants a rematch — play again?';
+        btn.onclick = requestRematch;
       }
       break;
+    }
     case 'rematch_go':
       resetGame();
       break;
@@ -135,7 +138,6 @@ async function setupPeerConnection() {
   }
 
   pc.ontrack = (e) => {
-    console.log('Got remote track!', e.streams);
     const v = document.getElementById('video-remote');
     v.srcObject = e.streams[0];
     v.onloadedmetadata = () => hideOverlay('overlay-remote');
@@ -146,13 +148,8 @@ async function setupPeerConnection() {
     socket.emit('game_event', { code: roomCode, type: 'ice', data: e.candidate });
   };
 
-  pc.oniceconnectionstatechange = () => {
-    console.log('ICE state:', pc.iceConnectionState);
-  };
-
-  pc.onconnectionstatechange = () => {
-    console.log('Connection state:', pc.connectionState);
-  };
+  pc.oniceconnectionstatechange = () => console.log('ICE state:', pc.iceConnectionState);
+  pc.onconnectionstatechange = () => console.log('Connection state:', pc.connectionState);
 }
 
 // ─── Camera ───────────────────────────────────────────────
@@ -361,7 +358,7 @@ function endRound(iWon) {
   document.getElementById('rs-you').textContent = scoreYou;
   document.getElementById('rs-them').textContent = scoreThem;
 
-  rematchVotes = 0;
+  iRequestedRematch = false;
   const btn = document.getElementById('next-btn');
   btn.disabled = false;
   btn.textContent = 'rematch?';
@@ -370,7 +367,7 @@ function endRound(iWon) {
 }
 
 function requestRematch() {
-  rematchVotes++;
+  iRequestedRematch = true;
   const btn = document.getElementById('next-btn');
   btn.disabled = true;
   btn.textContent = 'waiting for opponent...';
@@ -378,8 +375,8 @@ function requestRematch() {
 }
 
 async function resetGame() {
+  iRequestedRematch = false;
   scoreYou = 0; scoreThem = 0;
-  rematchVotes = 0;
   laughTriggered = false;
   updateScores();
 
@@ -394,14 +391,10 @@ async function resetGame() {
   document.getElementById('timer').classList.remove('danger');
   beginPrepPhase();
 
-  // Give both sides time to rebuild pc before signaling
   await new Promise(res => setTimeout(res, 800));
-
   await setupPeerConnection();
 
-  if (isHost) {
-    // Host waits for guest_ready, nothing to do
-  } else {
+  if (!isHost) {
     socket.emit('game_event', { code: roomCode, type: 'guest_ready' });
   }
 }
@@ -457,7 +450,7 @@ function cleanup() {
   detectionRunning = false;
   laughDetectionActive = false;
   calibrating = false;
-  rematchVotes = 0;
+  iRequestedRematch = false;
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   if (pc) { pc.close(); pc = null; }
   if (faceMesh) { faceMesh.close(); faceMesh = null; }
