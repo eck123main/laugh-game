@@ -20,8 +20,7 @@ const RTC_CONFIG = {
     }
   ]
 };
-const TOTAL_ROUNDS = 5;
-const PREP_SECONDS = 10;
+
 const LAUGH_SUSTAIN_MS = 1000;
 const CALIBRATION_FRAMES = 80;
 
@@ -31,8 +30,9 @@ let roomCode = null;
 let isHost = false;
 let timerInterval = null;
 let timerSecs = 0;
-let scoreYou = 0, scoreThem = 0, round = 1;
+let scoreYou = 0, scoreThem = 0;
 let roundActive = false;
+let rematchVotes = 0;
 
 // Detection state
 let faceMesh = null;
@@ -73,9 +73,7 @@ socket.on('game_start', async () => {
   initFaceDetection();
   if (isHost) {
     beginPrepPhase();
-    // Wait for guest to signal ready before sending offer
   } else {
-    // Guest signals ready
     socket.emit('game_event', { code: roomCode, type: 'guest_ready' });
     beginPrepPhase();
   }
@@ -83,17 +81,19 @@ socket.on('game_start', async () => {
 
 socket.on('game_event', async ({ type, data }) => {
   switch (type) {
-    case 'guest_ready':
+    case 'guest_ready': {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       socket.emit('game_event', { code: roomCode, type: 'offer', data: offer });
       break;
-    case 'offer':
+    }
+    case 'offer': {
       await pc.setRemoteDescription(new RTCSessionDescription(data));
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       socket.emit('game_event', { code: roomCode, type: 'answer', data: answer });
       break;
+    }
     case 'answer':
       await pc.setRemoteDescription(new RTCSessionDescription(data));
       break;
@@ -103,16 +103,15 @@ socket.on('game_event', async ({ type, data }) => {
     case 'i_laughed':
       endRound(true);
       break;
-    case 'next_round':
-      nextRoundGo();
-      break;
-    case 'rematch_accept':
-      resetGame();
-      break;
     case 'rematch_request':
-      if (confirm('Opponent wants a rematch! Accept?')) {
-        socket.emit('game_event', { code: roomCode, type: 'rematch_accept' });
+      rematchVotes++;
+      if (rematchVotes >= 2) {
         resetGame();
+      } else {
+        // They clicked rematch, echo ours back and wait
+        const btn = document.getElementById('next-btn');
+        btn.disabled = true;
+        btn.textContent = 'opponent wants a rematch...';
       }
       break;
   }
@@ -126,8 +125,7 @@ socket.on('opponent_left', () => {
 // ─── WebRTC ───────────────────────────────────────────────
 async function setupPeerConnection() {
   pc = new RTCPeerConnection(RTC_CONFIG);
-  
-  // Make sure we have a stream before adding tracks
+
   if (localStream) {
     localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
   } else {
@@ -139,12 +137,10 @@ async function setupPeerConnection() {
     const v = document.getElementById('video-remote');
     v.srcObject = e.streams[0];
     v.onloadedmetadata = () => hideOverlay('overlay-remote');
-    // Force play
     v.play().catch(err => console.warn('Video play failed:', err));
   };
 
   pc.onicecandidate = (e) => {
-    console.log('ICE candidate:', e.candidate);
     socket.emit('game_event', { code: roomCode, type: 'ice', data: e.candidate });
   };
 
@@ -192,13 +188,13 @@ function initFaceDetection() {
       console.log('FaceMesh ready');
       startDetectionLoop();
     });
-  } catch(e) {
+  } catch (e) {
     console.warn('FaceMesh failed, using manual mode');
     faceMesh = null;
     enableManualButton();
   }
 }
-// Mouth landmark indices
+
 const UPPER_LIP = 13, LOWER_LIP = 14, LEFT_CORNER = 78, RIGHT_CORNER = 308;
 
 function getLaughScore(lm) {
@@ -208,15 +204,14 @@ function getLaughScore(lm) {
   const ratio = openH / openW;
   const cornerMidY = (lm[LEFT_CORNER].y + lm[RIGHT_CORNER].y) / 2;
   const jawDrop = lm[LOWER_LIP].y - cornerMidY;
-  if (jawDrop < 0.01) return 0; // grin — no jaw drop, ignore
+  if (jawDrop < 0.01) return 0;
   return ratio;
 }
 
 function onFaceResults(results) {
   if (!results.multiFaceLandmarks || !results.multiFaceLandmarks.length) return;
   const ratio = getLaughScore(results.multiFaceLandmarks[0]);
-  // Update bar
-const threshold = baselineMouthRatio + (0.15 * sensitivityMultiplier);
+  const threshold = baselineMouthRatio + (0.15 * sensitivityMultiplier);
 
   const pct = Math.min((ratio / (threshold * 1.5)) * 100, 100);
   const bar = document.getElementById('mouth-indicator');
@@ -225,14 +220,12 @@ const threshold = baselineMouthRatio + (0.15 * sensitivityMultiplier);
     bar.style.background = ratio > threshold ? 'var(--danger)' : 'var(--accent)';
   }
 
-  // Silent calibration during prep
   if (calibrating) {
     calibrationSamples.push(ratio);
     if (calibrationSamples.length >= CALIBRATION_FRAMES) finishCalibration();
     return;
   }
 
-  // Laugh detection during round
   if (!laughDetectionActive || laughTriggered) return;
   if (ratio > threshold) {
     if (!laughStartTime) laughStartTime = Date.now();
@@ -284,46 +277,22 @@ function setSensitivity(val) {
 }
 
 // ─── Game Flow ────────────────────────────────────────────
-
-// Phase 1: 10 second prep — cameras on, stare at each other
-// Calibration happens silently in background
 function beginPrepPhase() {
   roundActive = false;
   laughDetectionActive = false;
   laughTriggered = false;
   laughStartTime = null;
   document.getElementById('laugh-btn').disabled = true;
-  document.getElementById('round-num').textContent = round;
   stopTimer();
   timerSecs = 0;
   updateTimerDisplay();
 
-  // Start silent calibration
   if (faceMesh) {
     calibrating = true;
     calibrationSamples = [];
   }
 
-  // Show prep countdown
-  let prepLeft = PREP_SECONDS;
-  setStatus(`round ${round} — stare down begins in ${prepLeft}...`);
-
-  const prepTimer = setInterval(() => {
-    prepLeft--;
-    if (prepLeft > 3) {
-      setStatus(`round ${round} — stare down begins in ${prepLeft}...`);
-    } else if (prepLeft > 0) {
-      setStatus(prepLeft + '...', true);
-    } else {
-      clearInterval(prepTimer);
-      beginCountdown();
-    }
-  }, 1000);
-}
-
-// Phase 2: 3-2-1 countdown then GO
-function beginCountdown() {
-  let count = 3;
+  let count = 5;
   setStatus(count + '...', true);
   const cd = setInterval(() => {
     count--;
@@ -336,20 +305,16 @@ function beginCountdown() {
   }, 1000);
 }
 
-// Phase 3: round is live
 function goRound() {
-  setStatus('😐  don\'t laugh.', true);
+  setStatus("😐  don't laugh.", true);
   roundActive = true;
   laughDetectionActive = true;
   laughTriggered = false;
   laughStartTime = null;
-  calibrating = false; // stop calibrating, start detecting
-
-  // Manual button enabled as fallback
+  calibrating = false;
   if (!faceMesh) {
     document.getElementById('laugh-btn').disabled = false;
   }
-
   startTimer();
 }
 
@@ -390,53 +355,34 @@ function endRound(iWon) {
   document.getElementById('round-emoji').textContent = iWon ? '🏆' : '😭';
   document.getElementById('round-title').textContent = iWon ? 'they laughed!' : 'you laughed';
   document.getElementById('round-title').className = 'result-title ' + (iWon ? 'win' : 'lose');
-  document.getElementById('round-sub').textContent = iWon ? 'you win the round' : 'opponent wins the round';
+  document.getElementById('round-sub').textContent = iWon ? 'you held it together' : 'opponent wins';
   document.getElementById('rs-you').textContent = scoreYou;
   document.getElementById('rs-them').textContent = scoreThem;
 
-  const needed = Math.ceil(TOTAL_ROUNDS / 2);
+  rematchVotes = 0;
   const btn = document.getElementById('next-btn');
-  if (scoreYou >= needed || scoreThem >= needed || round >= TOTAL_ROUNDS) {
-    btn.textContent = 'see final result';
-    btn.onclick = showGameOver;
-  } else {
-    btn.textContent = 'next round →';
-    btn.onclick = nextRound;
-  }
+  btn.disabled = false;
+  btn.textContent = 'rematch?';
+  btn.onclick = requestRematch;
   showScreen('round');
 }
 
-function nextRound() {
-  round++;
-  socket.emit('game_event', { code: roomCode, type: 'next_round' });
-  nextRoundGo();
-}
-
-function nextRoundGo() {
-  showScreen('game');
-  document.getElementById('timer').classList.remove('danger');
-  beginPrepPhase();
-}
-
-function showGameOver() {
-  const iWon = scoreYou > scoreThem;
-  document.getElementById('over-emoji').textContent = iWon ? '🏆' : '😭';
-  document.getElementById('over-title').textContent = iWon ? 'you win!' : 'you lose';
-  document.getElementById('over-title').className = 'result-title ' + (iWon ? 'win' : 'lose');
-  document.getElementById('os-you').textContent = scoreYou;
-  document.getElementById('os-them').textContent = scoreThem;
-  showScreen('over');
-}
-
-function rematch() {
+function requestRematch() {
+  rematchVotes++;
+  const btn = document.getElementById('next-btn');
+  btn.disabled = true;
+  btn.textContent = 'waiting for opponent...';
   socket.emit('game_event', { code: roomCode, type: 'rematch_request' });
+  if (rematchVotes >= 2) resetGame();
 }
 
 function resetGame() {
-  scoreYou = 0; scoreThem = 0; round = 1;
+  scoreYou = 0; scoreThem = 0;
+  rematchVotes = 0;
   laughTriggered = false;
   updateScores();
   showScreen('game');
+  document.getElementById('timer').classList.remove('danger');
   beginPrepPhase();
 }
 
@@ -491,11 +437,12 @@ function cleanup() {
   detectionRunning = false;
   laughDetectionActive = false;
   calibrating = false;
+  rematchVotes = 0;
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   if (pc) { pc.close(); pc = null; }
   if (faceMesh) { faceMesh.close(); faceMesh = null; }
-  roomCode = null; scoreYou = 0; scoreThem = 0; round = 1;
-  ['overlay-local','overlay-remote'].forEach(id => {
+  roomCode = null; scoreYou = 0; scoreThem = 0;
+  ['overlay-local', 'overlay-remote'].forEach(id => {
     const el = document.getElementById(id);
     if (el) { el.style.display = ''; el.style.opacity = '1'; }
   });
