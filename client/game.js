@@ -416,7 +416,7 @@ async function resetGame() {
   updateScores();
 
   if (pc) { pc.close(); pc = null; }
-  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  // don't touch audioCtx here — localStream is still alive
 
   const rv = document.getElementById('video-remote');
   rv.srcObject = null;
@@ -429,13 +429,11 @@ async function resetGame() {
 
   await new Promise(res => setTimeout(res, 800));
   await setupPeerConnection();
-  initAudioDetection();
 
   if (!isHost) {
     socket.emit('game_event', { code: roomCode, type: 'guest_ready' });
   }
 }
-
 // ─── Helpers ──────────────────────────────────────────────
 function updateScores() {
   document.getElementById('score-you').textContent = scoreYou;
