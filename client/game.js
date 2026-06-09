@@ -84,7 +84,6 @@ socket.on('game_start', async () => {
 socket.on('game_event', async ({ type, data }) => {
   switch (type) {
     case 'guest_ready':
-      // Host now sends offer knowing guest is set up
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       socket.emit('game_event', { code: roomCode, type: 'offer', data: offer });

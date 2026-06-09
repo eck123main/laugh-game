@@ -33,9 +33,9 @@ socket.on('join_room', (code) => {
   }, 500);
 });
 
-  socket.on('game_event', ({ code, type }) => {
-    socket.to(code).emit('game_event', { type });
-  });
+  socket.on('game_event', ({ code, type, data }) => {
+  socket.to(code).emit('game_event', { type, data }); // data forwarded ✓
+});
 
   socket.on('disconnect', () => {
     for (const code in rooms) {
