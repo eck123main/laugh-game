@@ -31,7 +31,6 @@ let timerInterval = null;
 let timerSecs = 0;
 let scoreYou = 0, scoreThem = 0;
 let roundActive = false;
-let iRequestedRematch = false;
 let audioCtx = null;
 
 // Detection state
@@ -105,18 +104,15 @@ socket.on('game_event', async ({ type, data }) => {
       endRound(true);
       break;
     case 'rematch_request': {
+      // Server tells us opponent clicked rematch — prompt us to click too
       const btn = document.getElementById('next-btn');
-      if (iRequestedRematch) {
-        iRequestedRematch = false;
-        resetGame();
-      } else {
-        btn.disabled = false;
-        btn.textContent = 'opponent wants a rematch — play again?';
-        btn.onclick = requestRematch;
-      }
+      btn.disabled = false;
+      btn.textContent = 'opponent wants a rematch — play again?';
+      btn.onclick = requestRematch;
       break;
     }
     case 'rematch_go':
+      // Server confirmed both clicked — reset
       resetGame();
       break;
   }
@@ -168,7 +164,7 @@ async function startCamera() {
 
 // ─── Audio Detection ──────────────────────────────────────
 function initAudioDetection() {
-  if (!localStream) return;
+  if (!localStream || audioCtx) return;
   try {
     audioCtx = new AudioContext();
     if (audioCtx.state === 'suspended') audioCtx.resume();
@@ -188,7 +184,6 @@ function initAudioDetection() {
           if (!laughStartTime) laughStartTime = Date.now();
           else if (Date.now() - laughStartTime > LAUGH_SUSTAIN_MS) triggerLaugh();
         } else {
-          // Only reset timer from audio if facemesh isn't also tracking
           if (!faceMesh) laughStartTime = null;
         }
       }
@@ -393,7 +388,6 @@ function endRound(iWon) {
   document.getElementById('rs-you').textContent = scoreYou;
   document.getElementById('rs-them').textContent = scoreThem;
 
-  iRequestedRematch = false;
   const btn = document.getElementById('next-btn');
   btn.disabled = false;
   btn.textContent = 'rematch?';
@@ -402,7 +396,6 @@ function endRound(iWon) {
 }
 
 function requestRematch() {
-  iRequestedRematch = true;
   const btn = document.getElementById('next-btn');
   btn.disabled = true;
   btn.textContent = 'waiting for opponent...';
@@ -410,13 +403,11 @@ function requestRematch() {
 }
 
 async function resetGame() {
-  iRequestedRematch = false;
   scoreYou = 0; scoreThem = 0;
   laughTriggered = false;
   updateScores();
 
   if (pc) { pc.close(); pc = null; }
-  // don't touch audioCtx here — localStream is still alive
 
   const rv = document.getElementById('video-remote');
   rv.srcObject = null;
@@ -434,6 +425,7 @@ async function resetGame() {
     socket.emit('game_event', { code: roomCode, type: 'guest_ready' });
   }
 }
+
 // ─── Helpers ──────────────────────────────────────────────
 function updateScores() {
   document.getElementById('score-you').textContent = scoreYou;
@@ -485,7 +477,6 @@ function cleanup() {
   detectionRunning = false;
   laughDetectionActive = false;
   calibrating = false;
-  iRequestedRematch = false;
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   if (pc) { pc.close(); pc = null; }
