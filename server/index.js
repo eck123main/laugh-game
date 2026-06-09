@@ -20,15 +20,18 @@ io.on('connection', (socket) => {
     socket.emit('room_created', code);
   });
 
-  socket.on('join_room', (code) => {
-    const room = rooms[code];
-    if (!room) return socket.emit('error', 'Room not found');
-    if (room.guest) return socket.emit('error', 'Room full');
-    room.guest = socket.id;
-    socket.join(code);
-    socket.emit('room_joined', code);
+socket.on('join_room', (code) => {
+  const room = rooms[code];
+  if (!room) return socket.emit('error', 'Room not found');
+  if (room.guest) return socket.emit('error', 'Room full');
+  room.guest = socket.id;
+  socket.join(code);
+  socket.emit('room_joined', code);
+  // Small delay to ensure both sides are ready
+  setTimeout(() => {
     io.to(code).emit('game_start');
-  });
+  }, 500);
+});
 
   socket.on('game_event', ({ code, type }) => {
     socket.to(code).emit('game_event', { type });

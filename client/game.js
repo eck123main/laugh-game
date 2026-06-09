@@ -72,23 +72,28 @@ socket.on('game_start', async () => {
   showScreen('game');
   initFaceDetection();
   if (isHost) {
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    socket.emit('game_event', { code: roomCode, type: 'offer', data: offer });
+    beginPrepPhase();
+    // Wait for guest to signal ready before sending offer
+  } else {
+    // Guest signals ready
+    socket.emit('game_event', { code: roomCode, type: 'guest_ready' });
     beginPrepPhase();
   }
 });
 
 socket.on('game_event', async ({ type, data }) => {
   switch (type) {
+    case 'guest_ready':
+      // Host now sends offer knowing guest is set up
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socket.emit('game_event', { code: roomCode, type: 'offer', data: offer });
+      break;
     case 'offer':
       await pc.setRemoteDescription(new RTCSessionDescription(data));
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       socket.emit('game_event', { code: roomCode, type: 'answer', data: answer });
-      showScreen('game');
-      initFaceDetection();
-      beginPrepPhase();
       break;
     case 'answer':
       await pc.setRemoteDescription(new RTCSessionDescription(data));
