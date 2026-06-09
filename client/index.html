@@ -40,14 +40,17 @@
 
 <!-- GAME -->
 <div class="screen" id="screen-game">
-  <div class="game-header">
-    <div><div class="round-label">round <span id="round-num">1</span> / 5</div></div>
+
+  <!-- Top HUD: round / timer / score overlaid on cameras -->
+  <div class="game-hud">
+    <div class="round-label">round <span id="round-num">1</span> / 5</div>
     <div class="timer-display" id="timer">0:00</div>
     <div class="score-display">
       <span class="you" id="score-you">0</span><span class="sep">–</span><span id="score-them">0</span>
     </div>
   </div>
 
+  <!-- Fullscreen cameras -->
   <div class="cams">
     <div class="cam-wrap">
       <video id="video-local" autoplay muted playsinline></video>
@@ -61,36 +64,36 @@
     </div>
   </div>
 
-  <!-- Calibration message -->
-  <div id="calibration-msg" style="display:none; font-family:var(--mono); font-size:11px; color:var(--accent); text-align:center; letter-spacing:2px; text-transform:uppercase; margin-bottom:8px; padding:10px; border:1px solid var(--accent); background:rgba(200,240,74,0.05);">
-    😐 &nbsp; hold a neutral expression &nbsp; calibrating...
+  <!-- Bottom HUD: status + detection bar + controls -->
+  <div class="game-bottom">
+
+    <!-- Mouth detection bar -->
+    <div id="detection-bar" style="width:320px;">
+      <div style="font-family:var(--mono);font-size:9px;color:rgba(255,255,255,0.3);letter-spacing:2px;text-transform:uppercase;margin-bottom:5px;display:flex;justify-content:space-between;">
+        <span>mouth openness</span>
+        <span>sensitivity:
+          <select onchange="setSensitivity(this.value)" style="background:rgba(0,0,0,0.5);color:rgba(255,255,255,0.6);border:1px solid rgba(255,255,255,0.1);font-family:var(--mono);font-size:9px;padding:1px 4px;">
+            <option value="0.6">high</option>
+            <option value="1.0" selected>medium</option>
+            <option value="1.5">low</option>
+          </select>
+        </span>
+      </div>
+      <div style="width:100%;height:3px;background:rgba(255,255,255,0.08);border-radius:2px;overflow:hidden;">
+        <div id="mouth-indicator" style="height:100%;width:0%;background:var(--accent);border-radius:2px;transition:width 0.05s,background 0.1s;"></div>
+      </div>
+    </div>
+
+    <div class="status-line" id="status-line">get ready...</div>
+
+    <!-- Manual fallback -->
+    <button class="laugh-btn" id="laugh-btn" onclick="iLaughed()" disabled style="display:none;">
+      😂 &nbsp; i laughed &nbsp; (manual)
+    </button>
+
+    <button class="btn danger" onclick="leaveGame()" style="width:auto;padding:8px 24px;opacity:0.4;font-size:10px;">leave</button>
   </div>
 
-  <!-- Mouth openness indicator bar -->
-  <div id="detection-bar" style="width:100%; margin-bottom:8px;">
-    <div style="font-family:var(--mono);font-size:9px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-bottom:4px;display:flex;justify-content:space-between;">
-      <span>mouth</span>
-      <span>sensitivity: 
-        <select onchange="setSensitivity(this.value)" style="background:var(--surface);color:var(--text);border:1px solid var(--border);font-family:var(--mono);font-size:9px;padding:1px 4px;">
-          <option value="0.6">high</option>
-          <option value="1.0" selected>medium</option>
-          <option value="1.5">low</option>
-        </select>
-      </span>
-    </div>
-    <div style="width:100%;height:4px;background:var(--border);border-radius:2px;overflow:hidden;">
-      <div id="mouth-indicator" style="height:100%;width:0%;background:var(--accent);border-radius:2px;transition:width 0.05s,background 0.1s;"></div>
-    </div>
-  </div>
-
-  <div class="status-line" id="status-line">get ready...</div>
-
-  <!-- Manual fallback button (hidden when AI detection works) -->
-  <button class="laugh-btn" id="laugh-btn" onclick="iLaughed()" disabled style="display:none;">
-    😂 &nbsp; i laughed &nbsp; (manual override)
-  </button>
-
-  <button class="btn danger" onclick="leaveGame()" style="opacity:0.5;font-size:11px;padding:10px;">leave game</button>
 </div>
 
 <!-- ROUND RESULT -->

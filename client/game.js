@@ -405,8 +405,13 @@ function setStatus(msg, highlight = false) {
 }
 
 function showScreen(id) {
-  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
-  document.getElementById('screen-' + id).classList.add('active');
+  document.querySelectorAll('.screen').forEach(s => {
+    s.classList.remove('active');
+    s.style.display = 'none';
+  });
+  const el = document.getElementById('screen-' + id);
+  el.style.display = '';
+  el.classList.add('active');
 }
 
 function hideOverlay(id) {
