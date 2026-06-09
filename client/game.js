@@ -1,11 +1,9 @@
 // ─── Config ───────────────────────────────────────────────
 const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 const TOTAL_ROUNDS = 5;
-
-// Laugh detection config
-const LAUGH_THRESHOLD_DEFAULT = 0.45; // mouth openness ratio to trigger laugh
-const LAUGH_SUSTAIN_MS = 600;         // must hold open this long to count
-const CALIBRATION_FRAMES = 60;        // frames to sample neutral face
+const PREP_SECONDS = 10;
+const LAUGH_SUSTAIN_MS = 500;
+const CALIBRATION_FRAMES = 80;
 
 // ─── State ────────────────────────────────────────────────
 let socket, pc, localStream;
@@ -16,18 +14,19 @@ let timerSecs = 0;
 let scoreYou = 0, scoreThem = 0, round = 1;
 let roundActive = false;
 
-// Laugh detection state
+// Detection state
 let faceMesh = null;
 let laughDetectionActive = false;
 let laughStartTime = null;
 let laughTriggered = false;
-let baselineMouthRatio = 0.02; // calibrated neutral ratio
+let baselineMouthRatio = 0.025;
 let sensitivityMultiplier = 1.0;
 let calibrating = false;
 let calibrationSamples = [];
 let detectionCanvas, detectionCtx;
+let detectionRunning = false;
 
-// ─── Socket setup ─────────────────────────────────────────
+// ─── Socket ───────────────────────────────────────────────
 socket = io();
 
 socket.on('room_created', (code) => {
@@ -51,12 +50,12 @@ socket.on('game_start', async () => {
   await startCamera();
   await setupPeerConnection();
   showScreen('game');
-  await initFaceDetection();
+  initFaceDetection();
   if (isHost) {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     socket.emit('game_event', { code: roomCode, type: 'offer', data: offer });
-    beginRoundCountdown();
+    beginPrepPhase();
   }
 });
 
@@ -68,8 +67,8 @@ socket.on('game_event', async ({ type, data }) => {
       await pc.setLocalDescription(answer);
       socket.emit('game_event', { code: roomCode, type: 'answer', data: answer });
       showScreen('game');
-      await initFaceDetection();
-      beginRoundCountdown();
+      initFaceDetection();
+      beginPrepPhase();
       break;
     case 'answer':
       await pc.setRemoteDescription(new RTCSessionDescription(data));
@@ -103,13 +102,11 @@ socket.on('opponent_left', () => {
 // ─── WebRTC ───────────────────────────────────────────────
 async function setupPeerConnection() {
   pc = new RTCPeerConnection(RTC_CONFIG);
-  if (localStream) localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+  if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
   pc.ontrack = (e) => {
-    const remoteVideo = document.getElementById('video-remote');
-    remoteVideo.srcObject = e.streams[0];
-    remoteVideo.onloadedmetadata = () => {
-      hideOverlay('overlay-remote');
-    };
+    const v = document.getElementById('video-remote');
+    v.srcObject = e.streams[0];
+    v.onloadedmetadata = () => hideOverlay('overlay-remote');
   };
   pc.onicecandidate = (e) => {
     socket.emit('game_event', { code: roomCode, type: 'ice', data: e.candidate });
@@ -122,116 +119,104 @@ async function startCamera() {
     localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
     const vid = document.getElementById('video-local');
     vid.srcObject = localStream;
-    await new Promise(res => vid.onloadedmetadata = res);
+    await new Promise(res => { vid.onloadedmetadata = res; });
     hideOverlay('overlay-local');
   } catch (e) {
     console.warn('Camera unavailable:', e);
-    setStatus('⚠ camera unavailable — manual mode');
   }
 }
 
-// ─── Face Mesh / Laugh Detection ──────────────────────────
-async function initFaceDetection() {
-  // Create hidden canvas for processing
+// ─── Face Detection ───────────────────────────────────────
+function initFaceDetection() {
   detectionCanvas = document.createElement('canvas');
   detectionCanvas.width = 320;
   detectionCanvas.height = 240;
   detectionCtx = detectionCanvas.getContext('2d');
 
   try {
-    // Load MediaPipe Face Mesh from CDN
     faceMesh = new FaceMesh({
       locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4/${file}`
     });
-
     faceMesh.setOptions({
       maxNumFaces: 1,
       refineLandmarks: true,
       minDetectionConfidence: 0.5,
       minTrackingConfidence: 0.5
     });
-
     faceMesh.onResults(onFaceResults);
-    await faceMesh.initialize();
-
-    console.log('Face detection ready');
-    updateSensitivityLabel();
-
-  } catch (e) {
-    console.warn('Face detection unavailable, falling back to manual:', e);
+    faceMesh.initialize().then(() => {
+      console.log('FaceMesh ready');
+      startDetectionLoop();
+    });
+  } catch(e) {
+    console.warn('FaceMesh failed, using manual mode');
     faceMesh = null;
-    showManualFallback();
+    enableManualButton();
   }
 }
 
-// Key mouth landmark indices in MediaPipe Face Mesh
-// Upper lip top: 13, Lower lip bottom: 14
-// Left mouth corner: 78, Right mouth corner: 308
-const UPPER_LIP = 13;
-const LOWER_LIP = 14;
-const LEFT_CORNER = 78;
-const RIGHT_CORNER = 308;
+// Mouth landmark indices
+const UPPER_LIP = 13, LOWER_LIP = 14, LEFT_CORNER = 78, RIGHT_CORNER = 308;
 
-function getMouthRatio(landmarks) {
-  const upper = landmarks[UPPER_LIP];
-  const lower = landmarks[LOWER_LIP];
-  const left  = landmarks[LEFT_CORNER];
-  const right = landmarks[RIGHT_CORNER];
-
-  const mouthHeight = Math.abs(lower.y - upper.y);
-  const mouthWidth  = Math.abs(right.x - left.x);
-
-  if (mouthWidth < 0.001) return 0;
-  return mouthHeight / mouthWidth;
+function getMouthRatio(lm) {
+  const h = Math.abs(lm[LOWER_LIP].y - lm[UPPER_LIP].y);
+  const w = Math.abs(lm[RIGHT_CORNER].x - lm[LEFT_CORNER].x);
+  return w < 0.001 ? 0 : h / w;
 }
 
 function onFaceResults(results) {
-  if (!laughDetectionActive && !calibrating) return;
-  if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) return;
+  if (!results.multiFaceLandmarks || !results.multiFaceLandmarks.length) return;
+  const ratio = getMouthRatio(results.multiFaceLandmarks[0]);
 
-  const landmarks = results.multiFaceLandmarks[0];
-  const ratio = getMouthRatio(landmarks);
+  // Update bar
+  const threshold = baselineMouthRatio + (0.07 * sensitivityMultiplier);
+  const pct = Math.min((ratio / (threshold * 1.5)) * 100, 100);
+  const bar = document.getElementById('mouth-indicator');
+  if (bar) {
+    bar.style.width = pct + '%';
+    bar.style.background = ratio > threshold ? 'var(--danger)' : 'var(--accent)';
+  }
 
-  // Update visual indicator
-  updateMouthIndicator(ratio);
-
+  // Silent calibration during prep
   if (calibrating) {
     calibrationSamples.push(ratio);
-    if (calibrationSamples.length >= CALIBRATION_FRAMES) {
-      finishCalibration();
-    }
+    if (calibrationSamples.length >= CALIBRATION_FRAMES) finishCalibration();
     return;
   }
 
+  // Laugh detection during round
   if (!laughDetectionActive || laughTriggered) return;
-
-  // Dynamic threshold = baseline * sensitivity multiplier * laugh factor
-  const threshold = baselineMouthRatio + (0.08 * sensitivityMultiplier);
-
   if (ratio > threshold) {
-    if (!laughStartTime) {
-      laughStartTime = Date.now();
-    } else if (Date.now() - laughStartTime > LAUGH_SUSTAIN_MS) {
-      triggerLaughDetected();
-    }
+    if (!laughStartTime) laughStartTime = Date.now();
+    else if (Date.now() - laughStartTime > LAUGH_SUSTAIN_MS) triggerLaugh();
   } else {
     laughStartTime = null;
   }
 }
 
-async function runFaceDetection() {
-  if (!faceMesh || !localStream) return;
-  const video = document.getElementById('video-local');
-  if (video.readyState < 2) {
-    requestAnimationFrame(runFaceDetection);
-    return;
-  }
-  detectionCtx.drawImage(video, 0, 0, 320, 240);
-  await faceMesh.send({ image: detectionCanvas });
-  requestAnimationFrame(runFaceDetection);
+function startDetectionLoop() {
+  if (detectionRunning) return;
+  detectionRunning = true;
+  const loop = async () => {
+    if (!faceMesh) return;
+    const video = document.getElementById('video-local');
+    if (video && video.readyState >= 2) {
+      detectionCtx.drawImage(video, 0, 0, 320, 240);
+      await faceMesh.send({ image: detectionCanvas });
+    }
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
 }
 
-function triggerLaughDetected() {
+function finishCalibration() {
+  calibrating = false;
+  const avg = calibrationSamples.reduce((a, b) => a + b, 0) / calibrationSamples.length;
+  baselineMouthRatio = avg;
+  console.log('Baseline:', baselineMouthRatio.toFixed(4));
+}
+
+function triggerLaugh() {
   if (laughTriggered || !roundActive) return;
   laughTriggered = true;
   laughDetectionActive = false;
@@ -239,90 +224,22 @@ function triggerLaughDetected() {
   endRound(false);
 }
 
-// ─── Calibration ──────────────────────────────────────────
-function startCalibration() {
-  calibrating = true;
-  calibrationSamples = [];
-  setStatus('😐 hold a neutral face...', false);
-  showCalibrationUI(true);
-}
-
-function finishCalibration() {
-  calibrating = false;
-  const avg = calibrationSamples.reduce((a, b) => a + b, 0) / calibrationSamples.length;
-  baselineMouthRatio = avg;
-  console.log('Baseline mouth ratio:', baselineMouthRatio.toFixed(4));
-  showCalibrationUI(false);
-  setStatus('calibrated! get ready...', false);
-  setTimeout(() => beginRoundCountdown(), 800);
-}
-
-// ─── UI helpers for detection ──────────────────────────────
-function updateMouthIndicator(ratio) {
-  const el = document.getElementById('mouth-indicator');
-  if (!el) return;
-  const threshold = baselineMouthRatio + (0.08 * sensitivityMultiplier);
-  const pct = Math.min((ratio / (threshold * 1.5)) * 100, 100);
-  el.style.width = pct + '%';
-  el.style.background = ratio > threshold ? 'var(--danger)' : 'var(--accent)';
-}
-
-function showManualFallback() {
+function enableManualButton() {
   const btn = document.getElementById('laugh-btn');
-  if (btn) {
-    btn.style.display = 'block';
-    btn.textContent = '😂  i laughed  (tap if detected fails)';
-  }
-  const ind = document.getElementById('detection-bar');
-  if (ind) ind.style.display = 'none';
-}
-
-function showCalibrationUI(show) {
-  const el = document.getElementById('calibration-msg');
-  if (el) el.style.display = show ? 'block' : 'none';
-}
-
-function updateSensitivityLabel() {
-  const el = document.getElementById('sensitivity-label');
-  if (el) {
-    const labels = { 0.6: 'high', 1.0: 'medium', 1.5: 'low' };
-    el.textContent = labels[sensitivityMultiplier] || 'medium';
-  }
+  if (btn) btn.style.display = 'block';
+  const bar = document.getElementById('detection-bar');
+  if (bar) bar.style.display = 'none';
 }
 
 function setSensitivity(val) {
   sensitivityMultiplier = parseFloat(val);
-  updateSensitivityLabel();
 }
 
-// ─── Lobby actions ────────────────────────────────────────
-function createRoom() {
-  document.getElementById('lobby-error').textContent = '';
-  const code = Math.random().toString(36).substring(2, 6).toUpperCase();
-  socket.emit('create_room', code);
-}
+// ─── Game Flow ────────────────────────────────────────────
 
-function joinRoom() {
-  document.getElementById('lobby-error').textContent = '';
-  const code = document.getElementById('join-code').value.trim().toUpperCase();
-  if (code.length !== 4) {
-    document.getElementById('lobby-error').textContent = 'enter a 4-letter code';
-    return;
-  }
-  socket.emit('join_room', code);
-}
-
-function goLobby() {
-  cleanup();
-  showScreen('lobby');
-}
-
-function leaveGame() {
-  if (confirm('Leave the game?')) goLobby();
-}
-
-// ─── Game flow ────────────────────────────────────────────
-function beginRoundCountdown() {
+// Phase 1: 10 second prep — cameras on, stare at each other
+// Calibration happens silently in background
+function beginPrepPhase() {
   roundActive = false;
   laughDetectionActive = false;
   laughTriggered = false;
@@ -333,41 +250,59 @@ function beginRoundCountdown() {
   timerSecs = 0;
   updateTimerDisplay();
 
-  // Calibrate on first round, then just count down
-  if (round === 1 && faceMesh) {
-    startCalibration();
-    runFaceDetection();
-    return;
+  // Start silent calibration
+  if (faceMesh) {
+    calibrating = true;
+    calibrationSamples = [];
   }
 
-  let countdown = 3;
-  setStatus('get ready...');
+  // Show prep countdown
+  let prepLeft = PREP_SECONDS;
+  setStatus(`round ${round} — stare down begins in ${prepLeft}...`);
 
-  const cd = setInterval(() => {
-    if (countdown > 0) {
-      setStatus(countdown + '...');
-      countdown--;
+  const prepTimer = setInterval(() => {
+    prepLeft--;
+    if (prepLeft > 3) {
+      setStatus(`round ${round} — stare down begins in ${prepLeft}...`);
+    } else if (prepLeft > 0) {
+      setStatus(prepLeft + '...', true);
     } else {
-      clearInterval(cd);
-      startRound();
+      clearInterval(prepTimer);
+      beginCountdown();
     }
   }, 1000);
 }
 
-function startRound() {
-  setStatus('😐 keep a straight face!', true);
+// Phase 2: 3-2-1 countdown then GO
+function beginCountdown() {
+  let count = 3;
+  setStatus(count + '...', true);
+  const cd = setInterval(() => {
+    count--;
+    if (count > 0) {
+      setStatus(count + '...', true);
+    } else {
+      clearInterval(cd);
+      goRound();
+    }
+  }, 1000);
+}
+
+// Phase 3: round is live
+function goRound() {
+  setStatus('😐  don\'t laugh.', true);
   roundActive = true;
   laughDetectionActive = true;
   laughTriggered = false;
   laughStartTime = null;
+  calibrating = false; // stop calibrating, start detecting
 
-  // Manual fallback button (hidden when AI detection is on)
+  // Manual button enabled as fallback
   if (!faceMesh) {
     document.getElementById('laugh-btn').disabled = false;
   }
 
   startTimer();
-  if (faceMesh) runFaceDetection();
 }
 
 function startTimer() {
@@ -401,7 +336,6 @@ function endRound(iWon) {
   laughDetectionActive = false;
   stopTimer();
   document.getElementById('laugh-btn').disabled = true;
-
   if (iWon) scoreYou++; else scoreThem++;
   updateScores();
 
@@ -421,7 +355,6 @@ function endRound(iWon) {
     btn.textContent = 'next round →';
     btn.onclick = nextRound;
   }
-
   showScreen('round');
 }
 
@@ -434,7 +367,7 @@ function nextRound() {
 function nextRoundGo() {
   showScreen('game');
   document.getElementById('timer').classList.remove('danger');
-  beginRoundCountdown();
+  beginPrepPhase();
 }
 
 function showGameOver() {
@@ -456,9 +389,10 @@ function resetGame() {
   laughTriggered = false;
   updateScores();
   showScreen('game');
-  beginRoundCountdown();
+  beginPrepPhase();
 }
 
+// ─── Helpers ──────────────────────────────────────────────
 function updateScores() {
   document.getElementById('score-you').textContent = scoreYou;
   document.getElementById('score-them').textContent = scoreThem;
@@ -477,20 +411,40 @@ function showScreen(id) {
 
 function hideOverlay(id) {
   const el = document.getElementById(id);
+  if (!el) return;
   el.style.opacity = '0';
   setTimeout(() => el.style.display = 'none', 300);
 }
 
+// ─── Lobby ────────────────────────────────────────────────
+function createRoom() {
+  document.getElementById('lobby-error').textContent = '';
+  const code = Math.random().toString(36).substring(2, 6).toUpperCase();
+  socket.emit('create_room', code);
+}
+
+function joinRoom() {
+  document.getElementById('lobby-error').textContent = '';
+  const code = document.getElementById('join-code').value.trim().toUpperCase();
+  if (code.length !== 4) { document.getElementById('lobby-error').textContent = 'enter a 4-letter code'; return; }
+  socket.emit('join_room', code);
+}
+
+function goLobby() { cleanup(); showScreen('lobby'); }
+function leaveGame() { if (confirm('Leave the game?')) goLobby(); }
+
 function cleanup() {
   stopTimer();
+  detectionRunning = false;
   laughDetectionActive = false;
+  calibrating = false;
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   if (pc) { pc.close(); pc = null; }
   if (faceMesh) { faceMesh.close(); faceMesh = null; }
   roomCode = null; scoreYou = 0; scoreThem = 0; round = 1;
-  ['overlay-local', 'overlay-remote'].forEach(id => {
+  ['overlay-local','overlay-remote'].forEach(id => {
     const el = document.getElementById(id);
-    el.style.display = ''; el.style.opacity = '1';
+    if (el) { el.style.display = ''; el.style.opacity = '1'; }
   });
   document.getElementById('overlay-local').textContent = '📷';
   document.getElementById('overlay-remote').textContent = '⏳';
