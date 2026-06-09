@@ -1,5 +1,18 @@
 // ─── Config ───────────────────────────────────────────────
-const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+// Always start on lobby
+document.addEventListener('DOMContentLoaded', () => {
+  showScreen('lobby');
+});
+const RTC_CONFIG = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
+  ]
+};
 const TOTAL_ROUNDS = 5;
 const PREP_SECONDS = 10;
 const LAUGH_SUSTAIN_MS = 1000;
