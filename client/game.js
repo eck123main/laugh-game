@@ -172,21 +172,77 @@ function initAudioDetection() {
     const analyser = audioCtx.createAnalyser();
     analyser.fftSize = 256;
     source.connect(analyser);
+
     const dataArray = new Uint8Array(analyser.frequencyBinCount);
+    const sampleRate = audioCtx.sampleRate;
+    const binHz = sampleRate / analyser.fftSize;
+
+    // Laughter lives in 300–3000 Hz (paper: MFCC spectral features)
+    const laughLow  = Math.floor(300  / binHz);
+    const laughHigh = Math.ceil(3000  / binHz);
+
+    // Pulse detection: laughter is ~4–8 bursts/sec
+    // We track energy transitions to count "pulses"
+    const PULSE_WINDOW_MS = 500;
+    const pulseHistory = [];
+    let lastEnergyHigh = false;
+    let pulseCount = 0;
+    let pulseWindowStart = 0;
+
+    const LAUGH_SUSTAIN_MS_AUDIO = 800; // slightly shorter since multi-stage
 
     const audioLoop = () => {
       if (!audioCtx) return;
       analyser.getByteFrequencyData(dataArray);
-      const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+
+      // Stage 1: overall energy gate (cheap, runs first)
+      const totalAvg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+      if (totalAvg < 25) {
+        laughStartTime = null;
+        lastEnergyHigh = false;
+        requestAnimationFrame(audioLoop);
+        return;
+      }
+
+      // Stage 2: spectral shape — laughter band ratio
+      let laughBandSum = 0;
+      for (let i = laughLow; i <= laughHigh; i++) laughBandSum += dataArray[i];
+      const laughBandAvg = laughBandSum / (laughHigh - laughLow + 1);
+      const laughRatio = laughBandAvg / (totalAvg + 1);
+
+      if (laughRatio < 0.55) {
+        laughStartTime = null;
+        requestAnimationFrame(audioLoop);
+        return;
+      }
+
+      // Stage 3: pulse rhythm (laughter is rhythmically pulsed, speech is steadier)
+      const now = Date.now();
+      const isHigh = laughBandAvg > 40;
+      if (isHigh && !lastEnergyHigh) {
+        // rising edge = new pulse
+        pulseHistory.push(now);
+      }
+      lastEnergyHigh = isHigh;
+
+      // Keep only pulses within the last PULSE_WINDOW_MS
+      const cutoff = now - PULSE_WINDOW_MS;
+      while (pulseHistory.length && pulseHistory[0] < cutoff) pulseHistory.shift();
+      pulseCount = pulseHistory.length;
+
+      // 4–8 pulses per 500ms = 8–16 per second — laughter rhythm
+      const pulsing = pulseCount >= 2 && pulseCount <= 8;
 
       if (laughDetectionActive && !laughTriggered) {
-        if (avg > 35) {
-          if (!laughStartTime) laughStartTime = Date.now();
-          else if (Date.now() - laughStartTime > LAUGH_SUSTAIN_MS) triggerLaugh();
+        if (pulsing) {
+          if (!laughStartTime) laughStartTime = now;
+          else if (now - laughStartTime > LAUGH_SUSTAIN_MS_AUDIO) triggerLaugh();
         } else {
-          if (!faceMesh) laughStartTime = null;
+          // steady signal — could be speech, not laughter
+          if (!faceMesh) laughStartTime = null; // only reset if no face detection backing us up
         }
       }
+
       requestAnimationFrame(audioLoop);
     };
     requestAnimationFrame(audioLoop);
