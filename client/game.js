@@ -32,6 +32,7 @@ let timerSecs = 0;
 let scoreYou = 0, scoreThem = 0;
 let roundActive = false;
 let iRequestedRematch = false;
+let audioCtx = null;
 
 // Detection state
 let faceMesh = null;
@@ -70,6 +71,7 @@ socket.on('game_start', async () => {
   await setupPeerConnection();
   showScreen('game');
   initFaceDetection();
+  initAudioDetection();
   if (isHost) {
     beginPrepPhase();
   } else {
@@ -105,11 +107,9 @@ socket.on('game_event', async ({ type, data }) => {
     case 'rematch_request': {
       const btn = document.getElementById('next-btn');
       if (iRequestedRematch) {
-        // Both sides ready — I already clicked, now they clicked
         iRequestedRematch = false;
         resetGame();
       } else {
-        // They clicked first, update button so I can confirm
         btn.disabled = false;
         btn.textContent = 'opponent wants a rematch — play again?';
         btn.onclick = requestRematch;
@@ -155,13 +155,48 @@ async function setupPeerConnection() {
 // ─── Camera ───────────────────────────────────────────────
 async function startCamera() {
   try {
-    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
     const vid = document.getElementById('video-local');
     vid.srcObject = localStream;
+    vid.muted = true;
     await new Promise(res => { vid.onloadedmetadata = res; });
     hideOverlay('overlay-local');
   } catch (e) {
     console.warn('Camera unavailable:', e);
+  }
+}
+
+// ─── Audio Detection ──────────────────────────────────────
+function initAudioDetection() {
+  if (!localStream) return;
+  try {
+    audioCtx = new AudioContext();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const source = audioCtx.createMediaStreamSource(localStream);
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    source.connect(analyser);
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+    const audioLoop = () => {
+      if (!audioCtx) return;
+      analyser.getByteFrequencyData(dataArray);
+      const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+
+      if (laughDetectionActive && !laughTriggered) {
+        if (avg > 35) {
+          if (!laughStartTime) laughStartTime = Date.now();
+          else if (Date.now() - laughStartTime > LAUGH_SUSTAIN_MS) triggerLaugh();
+        } else {
+          // Only reset timer from audio if facemesh isn't also tracking
+          if (!faceMesh) laughStartTime = null;
+        }
+      }
+      requestAnimationFrame(audioLoop);
+    };
+    requestAnimationFrame(audioLoop);
+  } catch (e) {
+    console.warn('Audio detection unavailable:', e);
   }
 }
 
@@ -381,6 +416,7 @@ async function resetGame() {
   updateScores();
 
   if (pc) { pc.close(); pc = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
 
   const rv = document.getElementById('video-remote');
   rv.srcObject = null;
@@ -393,6 +429,7 @@ async function resetGame() {
 
   await new Promise(res => setTimeout(res, 800));
   await setupPeerConnection();
+  initAudioDetection();
 
   if (!isHost) {
     socket.emit('game_event', { code: roomCode, type: 'guest_ready' });
@@ -451,6 +488,7 @@ function cleanup() {
   laughDetectionActive = false;
   calibrating = false;
   iRequestedRematch = false;
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   if (pc) { pc.close(); pc = null; }
   if (faceMesh) { faceMesh.close(); faceMesh = null; }
