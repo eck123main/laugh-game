@@ -154,20 +154,23 @@ function initFaceDetection() {
     enableManualButton();
   }
 }
-
 // Mouth landmark indices
 const UPPER_LIP = 13, LOWER_LIP = 14, LEFT_CORNER = 78, RIGHT_CORNER = 308;
 
-function getMouthRatio(lm) {
-  const h = Math.abs(lm[LOWER_LIP].y - lm[UPPER_LIP].y);
-  const w = Math.abs(lm[RIGHT_CORNER].x - lm[LEFT_CORNER].x);
-  return w < 0.001 ? 0 : h / w;
+function getLaughScore(lm) {
+  const openH = Math.abs(lm[LOWER_LIP].y - lm[UPPER_LIP].y);
+  const openW = Math.abs(lm[RIGHT_CORNER].x - lm[LEFT_CORNER].x);
+  if (openW < 0.001) return 0;
+  const ratio = openH / openW;
+  const cornerMidY = (lm[LEFT_CORNER].y + lm[RIGHT_CORNER].y) / 2;
+  const jawDrop = lm[LOWER_LIP].y - cornerMidY;
+  if (jawDrop < 0.01) return 0; // grin — no jaw drop, ignore
+  return ratio;
 }
 
 function onFaceResults(results) {
   if (!results.multiFaceLandmarks || !results.multiFaceLandmarks.length) return;
-  const ratio = getMouthRatio(results.multiFaceLandmarks[0]);
-
+  const ratio = getLaughScore(results.multiFaceLandmarks[0]);
   // Update bar
 const threshold = baselineMouthRatio + (0.15 * sensitivityMultiplier);
 
