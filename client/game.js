@@ -2,7 +2,7 @@
 const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 const TOTAL_ROUNDS = 5;
 const PREP_SECONDS = 10;
-const LAUGH_SUSTAIN_MS = 500;
+const LAUGH_SUSTAIN_MS = 1000;
 const CALIBRATION_FRAMES = 80;
 
 // ─── State ────────────────────────────────────────────────
@@ -169,7 +169,8 @@ function onFaceResults(results) {
   const ratio = getMouthRatio(results.multiFaceLandmarks[0]);
 
   // Update bar
-  const threshold = baselineMouthRatio + (0.07 * sensitivityMultiplier);
+const threshold = baselineMouthRatio + (0.15 * sensitivityMultiplier);
+
   const pct = Math.min((ratio / (threshold * 1.5)) * 100, 100);
   const bar = document.getElementById('mouth-indicator');
   if (bar) {
