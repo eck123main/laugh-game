@@ -23,6 +23,11 @@ const RTC_CONFIG = {
 const LAUGH_SUSTAIN_MS = 1000;
 const CALIBRATION_FRAMES = 80;
 
+// Shared detection config — same for both players, no per-player sensitivity
+const LAUGH_THRESHOLD_OPEN_RATIO    = 0.22;  // jaw drop needed to count as laugh
+const LAUGH_THRESHOLD_AUDIO_CONFIRM = 0.6;   // audio confidence needed solo (no face)
+const LAUGH_THRESHOLD_AUDIO_ASSIST  = 0.35;  // audio needed when face also active
+
 // ─── State ────────────────────────────────────────────────
 let socket, pc, localStream;
 let roomCode = null;
@@ -39,7 +44,6 @@ let laughDetectionActive = false;
 let laughStartTime = null;
 let laughTriggered = false;
 let baselineMouthRatio = 0.025;
-let sensitivityMultiplier = 1.0;
 let calibrating = false;
 let calibrationSamples = [];
 let detectionCanvas, detectionCtx;
@@ -104,7 +108,6 @@ socket.on('game_event', async ({ type, data }) => {
       endRound(true);
       break;
     case 'rematch_request': {
-      // Server tells us opponent clicked rematch — prompt us to click too
       const btn = document.getElementById('next-btn');
       btn.disabled = false;
       btn.textContent = 'opponent wants a rematch — play again?';
@@ -112,7 +115,6 @@ socket.on('game_event', async ({ type, data }) => {
       break;
     }
     case 'rematch_go':
-      // Server confirmed both clicked — reset
       resetGame();
       break;
   }
@@ -145,7 +147,7 @@ async function setupPeerConnection() {
   };
 
   pc.oniceconnectionstatechange = () => console.log('ICE state:', pc.iceConnectionState);
-  pc.onconnectionstatechange = () => console.log('Connection state:', pc.connectionState);
+  pc.onconnectionstatechange   = () => console.log('Connection state:', pc.connectionState);
 }
 
 // ─── Camera ───────────────────────────────────────────────
@@ -162,7 +164,7 @@ async function startCamera() {
   }
 }
 
-// ─── Audio Detection ──────────────────────────────────────
+// ─── Audio Detection (chuckle-pattern aware) ─────────────
 function initAudioDetection() {
   if (!localStream || audioCtx) return;
   try {
@@ -170,76 +172,62 @@ function initAudioDetection() {
     if (audioCtx.state === 'suspended') audioCtx.resume();
     const source = audioCtx.createMediaStreamSource(localStream);
     const analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 256;
+    analyser.fftSize = 512;
     source.connect(analyser);
 
     const dataArray = new Uint8Array(analyser.frequencyBinCount);
-    const sampleRate = audioCtx.sampleRate;
-    const binHz = sampleRate / analyser.fftSize;
-
-    // Laughter lives in 300–3000 Hz (paper: MFCC spectral features)
+    const binHz = audioCtx.sampleRate / analyser.fftSize;
     const laughLow  = Math.floor(300  / binHz);
     const laughHigh = Math.ceil(3000  / binHz);
 
-    // Pulse detection: laughter is ~4–8 bursts/sec
-    // We track energy transitions to count "pulses"
-    const PULSE_WINDOW_MS = 500;
+    // Pulse (chuckle burst) detection
     const pulseHistory = [];
-    let lastEnergyHigh = false;
-    let pulseCount = 0;
-    let pulseWindowStart = 0;
+    let lastEnergyState = false;
+    let audioLaughConfidence = 0; // 0.0 – 1.0
 
-    const LAUGH_SUSTAIN_MS_AUDIO = 800; // slightly shorter since multi-stage
+    window._getAudioConfidence = () => audioLaughConfidence;
 
     const audioLoop = () => {
       if (!audioCtx) return;
       analyser.getByteFrequencyData(dataArray);
 
-      // Stage 1: overall energy gate (cheap, runs first)
       const totalAvg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-      if (totalAvg < 25) {
-        laughStartTime = null;
-        lastEnergyHigh = false;
+
+      if (totalAvg < 20) {
+        audioLaughConfidence = 0;
+        lastEnergyState = false;
         requestAnimationFrame(audioLoop);
         return;
       }
 
-      // Stage 2: spectral shape — laughter band ratio
-      let laughBandSum = 0;
-      for (let i = laughLow; i <= laughHigh; i++) laughBandSum += dataArray[i];
-      const laughBandAvg = laughBandSum / (laughHigh - laughLow + 1);
-      const laughRatio = laughBandAvg / (totalAvg + 1);
+      // Spectral band ratio — laughter concentrates energy at 300–3000 Hz
+      let bandSum = 0;
+      for (let i = laughLow; i <= laughHigh; i++) bandSum += dataArray[i];
+      const bandAvg  = bandSum / (laughHigh - laughLow + 1);
+      const bandRatio = bandAvg / (totalAvg + 1);
 
-      if (laughRatio < 0.55) {
-        laughStartTime = null;
-        requestAnimationFrame(audioLoop);
-        return;
-      }
-
-      // Stage 3: pulse rhythm (laughter is rhythmically pulsed, speech is steadier)
+      // Chuckle pulse counting — rising edges in 500ms window
       const now = Date.now();
-      const isHigh = laughBandAvg > 40;
-      if (isHigh && !lastEnergyHigh) {
-        // rising edge = new pulse
-        pulseHistory.push(now);
-      }
-      lastEnergyHigh = isHigh;
+      const isHigh = bandAvg > 45;
+      if (isHigh && !lastEnergyState) pulseHistory.push(now);
+      lastEnergyState = isHigh;
 
-      // Keep only pulses within the last PULSE_WINDOW_MS
-      const cutoff = now - PULSE_WINDOW_MS;
+      const cutoff = now - 500;
       while (pulseHistory.length && pulseHistory[0] < cutoff) pulseHistory.shift();
-      pulseCount = pulseHistory.length;
+      const pulseCount = pulseHistory.length;
 
-      // 4–8 pulses per 500ms = 8–16 per second — laughter rhythm
-      const pulsing = pulseCount >= 2 && pulseCount <= 8;
+      // Confidence: spectral shape good + pulse rate in laughter range (2–8 per 500ms)
+      const spectralOk = bandRatio > 0.5;
+      const rhythmOk   = pulseCount >= 2 && pulseCount <= 8;
+      audioLaughConfidence = (spectralOk ? 0.5 : 0) + (rhythmOk ? 0.5 : 0);
 
-      if (laughDetectionActive && !laughTriggered) {
-        if (pulsing) {
+      // Audio-only trigger path (used when faceMesh unavailable)
+      if (laughDetectionActive && !laughTriggered && !faceMesh) {
+        if (audioLaughConfidence >= LAUGH_THRESHOLD_AUDIO_CONFIRM) {
           if (!laughStartTime) laughStartTime = now;
-          else if (now - laughStartTime > LAUGH_SUSTAIN_MS_AUDIO) triggerLaugh();
+          else if (now - laughStartTime > LAUGH_SUSTAIN_MS) triggerLaugh();
         } else {
-          // steady signal — could be speech, not laughter
-          if (!faceMesh) laughStartTime = null; // only reset if no face detection backing us up
+          laughStartTime = null;
         }
       }
 
@@ -289,16 +277,17 @@ function getLaughScore(lm) {
   const ratio = openH / openW;
   const cornerMidY = (lm[LEFT_CORNER].y + lm[RIGHT_CORNER].y) / 2;
   const jawDrop = lm[LOWER_LIP].y - cornerMidY;
-  if (jawDrop < 0.01) return 0;
+  if (jawDrop < 0.01) return 0; // smile without jaw drop won't pass
   return ratio;
 }
 
 function onFaceResults(results) {
   if (!results.multiFaceLandmarks || !results.multiFaceLandmarks.length) return;
-  const ratio = getLaughScore(results.multiFaceLandmarks[0]);
-  const threshold = baselineMouthRatio + (0.15 * sensitivityMultiplier);
+  const lm = results.multiFaceLandmarks[0];
+  const ratio = getLaughScore(lm);
 
-  const pct = Math.min((ratio / (threshold * 1.5)) * 100, 100);
+  const threshold = baselineMouthRatio + LAUGH_THRESHOLD_OPEN_RATIO;
+  const pct = Math.min((ratio / (threshold * 1.2)) * 100, 100);
   const bar = document.getElementById('mouth-indicator');
   if (bar) {
     bar.style.width = pct + '%';
@@ -312,7 +301,16 @@ function onFaceResults(results) {
   }
 
   if (!laughDetectionActive || laughTriggered) return;
-  if (ratio > threshold) {
+
+  const faceTriggered = ratio > threshold;
+  const audioConf = window._getAudioConfidence ? window._getAudioConfidence() : 0;
+
+  // Very strong face signal alone can trigger (silent laugh)
+  const strongFace = ratio > (baselineMouthRatio + LAUGH_THRESHOLD_OPEN_RATIO * 1.5);
+  // Normal face + some audio confirmation
+  const combined   = faceTriggered && audioConf >= LAUGH_THRESHOLD_AUDIO_ASSIST;
+
+  if (strongFace || combined) {
     if (!laughStartTime) laughStartTime = Date.now();
     else if (Date.now() - laughStartTime > LAUGH_SUSTAIN_MS) triggerLaugh();
   } else {
@@ -357,9 +355,8 @@ function enableManualButton() {
   if (bar) bar.style.display = 'none';
 }
 
-function setSensitivity(val) {
-  sensitivityMultiplier = parseFloat(val);
-}
+// no-op — sensitivity removed, thresholds are fixed and consistent for both players
+function setSensitivity(val) {}
 
 // ─── Game Flow ────────────────────────────────────────────
 function beginPrepPhase() {
@@ -437,11 +434,11 @@ function endRound(iWon) {
   if (iWon) scoreYou++; else scoreThem++;
   updateScores();
 
-  document.getElementById('round-emoji').textContent = iWon ? '🏆' : '😭';
-  document.getElementById('round-title').textContent = iWon ? 'they laughed!' : 'you laughed';
-  document.getElementById('round-title').className = 'result-title ' + (iWon ? 'win' : 'lose');
-  document.getElementById('round-sub').textContent = iWon ? 'you held it together' : 'opponent wins';
-  document.getElementById('rs-you').textContent = scoreYou;
+  document.getElementById('round-emoji').textContent  = iWon ? '🏆' : '😭';
+  document.getElementById('round-title').textContent  = iWon ? 'they laughed!' : 'you laughed';
+  document.getElementById('round-title').className    = 'result-title ' + (iWon ? 'win' : 'lose');
+  document.getElementById('round-sub').textContent    = iWon ? 'you held it together' : 'opponent wins';
+  document.getElementById('rs-you').textContent  = scoreYou;
   document.getElementById('rs-them').textContent = scoreThem;
 
   const btn = document.getElementById('next-btn');
@@ -484,7 +481,7 @@ async function resetGame() {
 
 // ─── Helpers ──────────────────────────────────────────────
 function updateScores() {
-  document.getElementById('score-you').textContent = scoreYou;
+  document.getElementById('score-you').textContent  = scoreYou;
   document.getElementById('score-them').textContent = scoreThem;
 }
 
@@ -525,7 +522,7 @@ function joinRoom() {
   socket.emit('join_room', code);
 }
 
-function goLobby() { cleanup(); showScreen('lobby'); }
+function goLobby()  { cleanup(); showScreen('lobby'); }
 function leaveGame() { if (confirm('Leave the game?')) goLobby(); }
 
 function cleanup() {
@@ -537,14 +534,15 @@ function cleanup() {
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   if (pc) { pc.close(); pc = null; }
   if (faceMesh) { faceMesh.close(); faceMesh = null; }
+  window._getAudioConfidence = null;
   roomCode = null; scoreYou = 0; scoreThem = 0;
   ['overlay-local', 'overlay-remote'].forEach(id => {
     const el = document.getElementById(id);
     if (el) { el.style.display = ''; el.style.opacity = '1'; }
   });
-  document.getElementById('overlay-local').textContent = '📷';
+  document.getElementById('overlay-local').textContent  = '📷';
   document.getElementById('overlay-remote').textContent = '⏳';
-  document.getElementById('video-local').srcObject = null;
+  document.getElementById('video-local').srcObject  = null;
   document.getElementById('video-remote').srcObject = null;
   document.getElementById('join-code').value = '';
   document.getElementById('timer').classList.remove('danger');
