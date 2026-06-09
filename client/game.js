@@ -1,27 +1,22 @@
-// ─── Config ───────────────────────────────────────────────
 // Always start on lobby
 document.addEventListener('DOMContentLoaded', () => {
   showScreen('lobby');
 });
+
 const RTC_CONFIG = {
   iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:oz-turn-1.xirsys.com' },
     {
-      urls: 'turn:openrelay.metered.ca:80',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
-    },
-    {
-      urls: 'turn:openrelay.metered.ca:443',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
-    },
-    {
-      urls: 'turns:openrelay.metered.ca:443',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
+      username: '2-TFMaK-hIvZBmLtI4uGRRUoE_xWlyEC_unifkTZ197vLn2zBfWoTPfFuYaWXTjXAAAAAGonjuxyZXRvcm5pdHk=',
+      credential: '3176d1aa-63b7-11f1-bb1d-0242ac120004',
+      urls: [
+        'turn:oz-turn-1.xirsys.com:80?transport=udp',
+        'turn:oz-turn-1.xirsys.com:3478?transport=udp',
+        'turn:oz-turn-1.xirsys.com:80?transport=tcp',
+        'turn:oz-turn-1.xirsys.com:3478?transport=tcp',
+        'turns:oz-turn-1.xirsys.com:443?transport=tcp',
+        'turns:oz-turn-1.xirsys.com:5349?transport=tcp'
+      ]
     }
   ]
 };
