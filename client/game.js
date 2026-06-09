@@ -1,4 +1,3 @@
-// Always start on lobby
 document.addEventListener('DOMContentLoaded', () => {
   showScreen('lobby');
 });
@@ -106,13 +105,16 @@ socket.on('game_event', async ({ type, data }) => {
     case 'rematch_request':
       rematchVotes++;
       if (rematchVotes >= 2) {
+        socket.emit('game_event', { code: roomCode, type: 'rematch_go' });
         resetGame();
       } else {
-        // They clicked rematch, echo ours back and wait
         const btn = document.getElementById('next-btn');
         btn.disabled = true;
         btn.textContent = 'opponent wants a rematch...';
       }
+      break;
+    case 'rematch_go':
+      resetGame();
       break;
   }
 });
@@ -373,17 +375,31 @@ function requestRematch() {
   btn.disabled = true;
   btn.textContent = 'waiting for opponent...';
   socket.emit('game_event', { code: roomCode, type: 'rematch_request' });
-  if (rematchVotes >= 2) resetGame();
 }
 
-function resetGame() {
+async function resetGame() {
   scoreYou = 0; scoreThem = 0;
   rematchVotes = 0;
   laughTriggered = false;
   updateScores();
+
+  if (pc) { pc.close(); pc = null; }
+  await setupPeerConnection();
+
+  const rv = document.getElementById('video-remote');
+  rv.srcObject = null;
+  const ol = document.getElementById('overlay-remote');
+  if (ol) { ol.style.display = ''; ol.style.opacity = '1'; ol.textContent = '⏳'; }
+
   showScreen('game');
   document.getElementById('timer').classList.remove('danger');
-  beginPrepPhase();
+
+  if (isHost) {
+    beginPrepPhase();
+  } else {
+    socket.emit('game_event', { code: roomCode, type: 'guest_ready' });
+    beginPrepPhase();
+  }
 }
 
 // ─── Helpers ──────────────────────────────────────────────
