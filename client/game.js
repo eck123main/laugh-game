@@ -553,4 +553,66 @@ document.addEventListener('keydown', e => {
     e.preventDefault();
     if (!document.getElementById('laugh-btn').disabled) iLaughed();
   }
+function beginPrepPhase() {
+  roundActive = false;
+  laughDetectionActive = false;
+  laughTriggered = false;
+  laughStartTime = null;
+  document.getElementById('laugh-btn').disabled = true;
+  stopTimer();
+  timerSecs = 0;
+  updateTimerDisplay();
+  setStatus('', false);
+
+  if (faceMesh) {
+    calibrating = true;
+    calibrationSamples = [];
+  }
+
+  // Blur both videos
+  document.getElementById('video-local').className = 'blurred';
+  document.getElementById('video-remote').className = 'blurred';
+
+  runCountdown([3, 2, 1, 'GO'], () => {
+    // Unblur on GO
+    document.getElementById('video-local').className = 'unblurred';
+    document.getElementById('video-remote').className = 'unblurred';
+    goRound();
+  });
+}
+
+function runCountdown(steps, onDone) {
+  // Remove any existing overlay
+  const existing = document.getElementById('countdown-overlay');
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.className = 'countdown-overlay';
+  overlay.id = 'countdown-overlay';
+  document.body.appendChild(overlay);
+
+  let i = 0;
+
+  const showNext = () => {
+    if (i >= steps.length) {
+      overlay.remove();
+      onDone();
+      return;
+    }
+
+    const val = steps[i];
+    i++;
+
+    // Clear and show new number
+    overlay.innerHTML = '';
+    const el = document.createElement('div');
+    el.className = 'countdown-number' + (val === 'GO' ? ' go' : '');
+    el.textContent = val;
+    overlay.appendChild(el);
+
+    setTimeout(showNext, 900);
+  };
+
+  showNext();
+}
 });
