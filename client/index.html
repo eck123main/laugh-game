@@ -19,15 +19,28 @@
     live — try not to laugh
   </div>
   <div class="logo"><span>o</span>giggle</div>
-  <div class="tagline">1v1 laugh detection</div>
+  <div class="tagline">multiplayer laugh detection</div>
   <div class="lobby-actions">
-    <div style="display:flex;gap:8px;margin-bottom:4px;">
-  <span style="font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:2px;align-self:center;text-transform:uppercase;white-space:nowrap;">best of</span>
-  <button class="btn" id="bo-1" onclick="setBestOf(1)" style="padding:8px;font-size:11px;">1</button>
-  <button class="btn" id="bo-3" onclick="setBestOf(3)" style="padding:8px;font-size:11px;">3</button>
-  <button class="btn primary" id="bo-5" onclick="setBestOf(5)" style="padding:8px;font-size:11px;">5</button>
-</div>
-    <button class="btn primary" onclick="createRoom()">create room</button>
+
+    <div class="lobby-option-row">
+      <span class="lobby-option-label">players</span>
+      <div class="btn-group">
+        <button class="btn" id="mp-2" onclick="setMaxPlayers(2)">2</button>
+        <button class="btn" id="mp-3" onclick="setMaxPlayers(3)">3</button>
+        <button class="btn" id="mp-4" onclick="setMaxPlayers(4)">4</button>
+      </div>
+    </div>
+
+    <div class="lobby-option-row">
+      <span class="lobby-option-label">best of</span>
+      <div class="btn-group">
+        <button class="btn" id="bo-1" onclick="setBestOf(1)">1</button>
+        <button class="btn" id="bo-3" onclick="setBestOf(3)">3</button>
+        <button class="btn primary" id="bo-5" onclick="setBestOf(5)">5</button>
+      </div>
+    </div>
+
+    <button class="btn primary" onclick="createRoom()" style="margin-top:4px;">create room</button>
     <div class="divider"></div>
     <div class="input-row">
       <input type="text" id="join-code" maxlength="4" placeholder="room code" oninput="this.value=this.value.toUpperCase()">
@@ -43,9 +56,10 @@
 <!-- WAITING -->
 <div class="screen" id="screen-waiting">
   <div class="logo" style="font-size:40px; margin-bottom:4px;"><span style="color:var(--accent)">o</span>giggle</div>
-  <div class="tagline" style="margin-bottom:2rem;">waiting for opponent</div>
+  <div class="tagline" style="margin-bottom:2rem;">waiting for players</div>
   <div class="room-code-display" id="room-code-display">----</div>
-  <p style="font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-bottom:1.5rem;">share this code with a friend</p>
+  <p style="font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-bottom:0.75rem;">share this code with friends</p>
+  <p style="font-family:var(--mono);font-size:13px;color:var(--accent);letter-spacing:2px;margin-bottom:1.5rem;" id="waiting-count">1 / 2 players</p>
   <div class="waiting-dots" style="margin-bottom:2rem;"><span></span><span></span><span></span></div>
   <button class="btn" style="max-width:200px;" onclick="goLobby()">cancel</button>
 </div>
@@ -61,18 +75,8 @@
     </div>
   </div>
 
-  <div class="cams">
-    <div class="cam-wrap">
-      <video id="video-local" autoplay muted playsinline></video>
-      <div class="cam-overlay" id="overlay-local">📷</div>
-      <div class="cam-label you"><span class="live-dot"></span>you</div>
-    </div>
-    <div class="cam-wrap">
-      <video id="video-remote" autoplay playsinline></video>
-      <div class="cam-overlay" id="overlay-remote">⏳</div>
-      <div class="cam-label">opponent</div>
-    </div>
-  </div>
+  <!-- Camera grid — populated dynamically -->
+  <div class="cams players-2" id="cams"></div>
 
   <div class="game-bottom">
     <div id="detection-bar" style="width:320px;">
@@ -108,9 +112,9 @@
 <div class="screen" id="screen-over">
   <div class="result-emoji" id="over-emoji">🏆</div>
   <div class="result-title" id="over-title">you win</div>
-  <div class="result-sub">best of 5</div>
+  <div class="result-sub" id="over-sub"></div>
   <div class="final-score"><span class="accent" id="os-you">0</span> – <span id="os-them">0</span></div>
-  <button class="btn primary" style="max-width:260px; margin-bottom:10px;" onclick="rematch()">rematch</button>
+  <button class="btn primary" style="max-width:260px; margin-bottom:10px;" onclick="requestRematch()">rematch</button>
   <button class="btn" style="max-width:260px;" onclick="goLobby()">leave</button>
 </div>
 
