@@ -19,9 +19,7 @@
 }
 
 /* ─── Base ───────────────────────────────────────────────── */
-html, body {
-  height: 100%;
-}
+html, body { height: 100%; }
 
 body {
   background: var(--bg);
@@ -111,6 +109,37 @@ body {
   letter-spacing: 2px;
 }
 
+/* ─── Lobby option rows ──────────────────────────────────── */
+.lobby-option-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  max-width: 340px;
+}
+
+.lobby-option-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  white-space: nowrap;
+  min-width: 52px;
+}
+
+.btn-group {
+  display: flex;
+  gap: 6px;
+  flex: 1;
+}
+
+.btn-group .btn {
+  flex: 1;
+  padding: 10px 8px;
+  font-size: 11px;
+}
+
 /* ─── Buttons ────────────────────────────────────────────── */
 .btn {
   width: 100%;
@@ -126,15 +155,6 @@ body {
   text-transform: uppercase;
   position: relative;
   overflow: hidden;
-}
-
-.btn::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background: var(--text);
-  opacity: 0;
-  transition: opacity 0.15s;
 }
 
 .btn:hover { border-color: var(--muted); background: var(--surface); }
@@ -262,14 +282,31 @@ input[type="text"]::placeholder {
   flex-direction: column;
 }
 
-/* Cameras fill the whole screen */
+/* ─── Camera grid ────────────────────────────────────────── */
 .cams {
   display: grid;
-  grid-template-columns: 1fr 1fr;
   gap: 2px;
   flex: 1;
   min-height: 0;
   background: #000;
+}
+
+/* 2 players: side by side */
+.cams.players-2 {
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr;
+}
+
+/* 3 players: THREE equal columns side by side  | | | */
+.cams.players-3 {
+  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-rows: 1fr;
+}
+
+/* 4 players: 2×2 grid */
+.cams.players-4 {
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
 }
 
 .cam-wrap {
@@ -315,7 +352,25 @@ input[type="text"]::placeholder {
   pointer-events: none;
 }
 
-/* HUD overlaid on top of cameras */
+/* ─── Laugh badge ────────────────────────────────────────── */
+.laugh-badge {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%) scale(0);
+  font-size: 64px;
+  opacity: 0;
+  transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.3s;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.laugh-badge.visible {
+  transform: translate(-50%, -50%) scale(1);
+  opacity: 1;
+}
+
+/* ─── HUD overlaid on top of cameras ────────────────────── */
 .game-hud {
   position: fixed;
   top: 0; left: 0; right: 0;
@@ -367,7 +422,7 @@ input[type="text"]::placeholder {
   50% { opacity: 0.4; }
 }
 
-/* Bottom HUD — status + detection bar */
+/* ─── Bottom HUD ─────────────────────────────────────────── */
 .game-bottom {
   position: fixed;
   bottom: 0; left: 0; right: 0;
@@ -460,7 +515,7 @@ input[type="text"]::placeholder {
   line-height: 1;
 }
 
-.result-title.win { color: var(--accent); }
+.result-title.win  { color: var(--accent); }
 .result-title.lose { color: var(--danger); }
 
 .result-sub {
@@ -494,24 +549,14 @@ input[type="text"]::placeholder {
   opacity: 0.7;
 }
 
-/* ─── Scrollbar ──────────────────────────────────────────── */
-::-webkit-scrollbar { width: 4px; }
-::-webkit-scrollbar-track { background: var(--bg); }
-::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-
-/* ─── Mobile ─────────────────────────────────────────────── */
-@media (max-width: 480px) {
-  .screen { padding: 1rem; }
-  .logo { font-size: 42px; letter-spacing: -3px; }
-  .cams { gap: 6px; }
-  .game-header { padding-bottom: 8px; margin-bottom: 8px; }
-  .timer-display { font-size: 22px; }
-  .score-display { font-size: 16px; }
-  .laugh-btn { padding: 16px; font-size: 11px; }
-  .result-title { font-size: 36px; }
-  .result-emoji { font-size: 60px; }
+/* ─── Waiting player count ───────────────────────────────── */
+#waiting-count {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--accent);
+  letter-spacing: 2px;
 }
-/* ─── Countdown overlay ──────────────────────────────────── */
+
 /* ─── Countdown overlay ──────────────────────────────────── */
 .countdown-overlay {
   position: fixed;
@@ -553,84 +598,21 @@ input[type="text"]::placeholder {
 .cam-wrap video.unblurred {
   filter: blur(0px) brightness(1);
   transition: filter 1.2s ease;
-/* ─── Lobby option rows ──────────────────────────────────── */
-.lobby-option-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  width: 100%;
-  max-width: 340px;
 }
 
-.lobby-option-label {
-  font-family: var(--mono);
-  font-size: 10px;
-  color: var(--muted);
-  letter-spacing: 2px;
-  text-transform: uppercase;
-  white-space: nowrap;
-  min-width: 52px;
-}
+/* ─── Scrollbar ──────────────────────────────────────────── */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 
-.btn-group {
-  display: flex;
-  gap: 6px;
-  flex: 1;
-}
-
-.btn-group .btn {
-  flex: 1;
-  padding: 10px 8px;
-  font-size: 11px;
-}
-
-/* ─── Camera grid layouts ────────────────────────────────── */
-
-/* 2 players: side by side (original) */
-.cams.players-2 {
-  grid-template-columns: 1fr 1fr;
-  grid-template-rows: 1fr;
-}
-
-/* 3 players: one large on top, two below */
-.cams.players-3 {
-  grid-template-columns: 1fr 1fr;
-  grid-template-rows: 1fr 1fr;
-}
-
-.cams.players-3 .cam-wrap:first-child {
-  grid-column: 1 / -1; /* spans full width */
-}
-
-/* 4 players: 2x2 grid */
-.cams.players-4 {
-  grid-template-columns: 1fr 1fr;
-  grid-template-rows: 1fr 1fr;
-}
-
-/* ─── Laugh badge on cam tile ────────────────────────────── */
-.laugh-badge {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%) scale(0);
-  font-size: 64px;
-  opacity: 0;
-  transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.3s;
-  pointer-events: none;
-  z-index: 5;
-}
-
-.laugh-badge.visible {
-  transform: translate(-50%, -50%) scale(1);
-  opacity: 1;
-}
-
-/* ─── Waiting player count ───────────────────────────────── */
-#waiting-count {
-  font-family: var(--mono);
-  font-size: 13px;
-  color: var(--accent);
-  letter-spacing: 2px;
-}
+/* ─── Mobile ─────────────────────────────────────────────── */
+@media (max-width: 480px) {
+  .screen { padding: 1rem; }
+  .logo { font-size: 42px; letter-spacing: -3px; }
+  .cams { gap: 4px; }
+  .timer-display { font-size: 22px; }
+  .score-display { font-size: 16px; }
+  .laugh-btn { padding: 16px; font-size: 11px; }
+  .result-title { font-size: 36px; }
+  .result-emoji { font-size: 60px; }
 }

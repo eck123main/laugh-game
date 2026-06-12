@@ -24,13 +24,14 @@ io.on('connection', (socket) => {
     socket.join(code);
     socket.data.roomCode = code;
     socket.emit('room_created', code);
-    socket.emit('room_update', { players: rooms[code].players, maxPlayers: rooms[code].maxPlayers });
+    io.to(code).emit('room_update', { players: rooms[code].players, maxPlayers: rooms[code].maxPlayers });
   });
 
   socket.on('join_room', (code) => {
     const room = rooms[code];
     if (!room) return socket.emit('error', 'Room not found');
     if (room.players.length >= room.maxPlayers) return socket.emit('error', 'Room full');
+
     room.players.push(socket.id);
     socket.join(code);
     socket.data.roomCode = code;
@@ -60,15 +61,16 @@ io.on('connection', (socket) => {
       } else {
         socket.to(code).emit('game_event', {
           type: 'rematch_vote',
-          data: { votes: room.rematchVotes.size, needed: room.players.length }
+          data: { votes: room.rematchVotes.size, needed: room.players.length },
+          fromId: socket.id
         });
       }
+    } else if (data && data.targetId) {
+      // Targeted signalling message (WebRTC offer/answer/ice)
+      io.to(data.targetId).emit('game_event', { type, data, fromId: socket.id });
     } else {
-      if (data && data.targetId) {
-        io.to(data.targetId).emit('game_event', { type, data, fromId: socket.id });
-      } else {
-        socket.to(code).emit('game_event', { type, data, fromId: socket.id });
-      }
+      // Broadcast to everyone else in the room
+      socket.to(code).emit('game_event', { type, data, fromId: socket.id });
     }
   });
 

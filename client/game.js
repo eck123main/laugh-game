@@ -29,14 +29,15 @@ const LAUGH_THRESHOLD_AUDIO_CONFIRM = 0.6;
 const LAUGH_THRESHOLD_AUDIO_ASSIST  = 0.35;
 
 // ─── State ────────────────────────────────────────────────
-let socket, localStream;
+let localStream;
 let roomCode = null;
-let myId = null;
 
-// peers maps peerId -> { pc, stream }
-let peers = {};
-// ordered list of all player IDs (index = slot)
-let playerOrder = [];
+// Use socket.id directly — never cache into myId variable to avoid stale reads
+const socket = io();
+const me = () => socket.id;
+
+let peers = {};          // peerId -> RTCPeerConnection
+let playerOrder = [];    // ordered list of socket IDs, index = slot
 let maxPlayers = 2;
 let bestOf = 5;
 let selectedBestOf = 5;
@@ -45,12 +46,11 @@ let selectedMaxPlayers = 2;
 let timerInterval = null;
 let timerSecs = 0;
 
-// scores[peerId] = round wins
-let scores = {};
-// allTimeScores[peerId] = total wins across rematches
-let allTimeScores = {};
+let scores = {};         // id -> round wins this match
+let allTimeScores = {};  // id -> total wins across rematches
 
-let laughedThisRound = new Set(); // peerIds who laughed
+let laughedThisRound = new Set();
+let nextRoundVotes = new Set();
 let roundActive = false;
 let audioCtx = null;
 
@@ -65,13 +65,7 @@ let calibrationSamples = [];
 let detectionCanvas, detectionCtx;
 let detectionRunning = false;
 
-// ─── Socket ───────────────────────────────────────────────
-socket = io();
-
-socket.on('connect', () => {
-  myId = socket.id;
-});
-
+// ─── Socket handlers ──────────────────────────────────────
 socket.on('room_created', (code) => {
   roomCode = code;
   document.getElementById('room-code-display').textContent = code;
@@ -81,12 +75,13 @@ socket.on('room_created', (code) => {
 
 socket.on('room_joined', (code) => {
   roomCode = code;
+  // Camera starts when game_start fires
 });
 
 socket.on('room_update', ({ players, maxPlayers: mp }) => {
   maxPlayers = mp;
-  const waiting = document.getElementById('waiting-count');
-  if (waiting) waiting.textContent = players.length + ' / ' + mp + ' players';
+  const el = document.getElementById('waiting-count');
+  if (el) el.textContent = players.length + ' / ' + mp + ' players';
 });
 
 socket.on('error', (msg) => {
@@ -97,9 +92,7 @@ socket.on('game_start', async ({ bestOf: bo, players, maxPlayers: mp }) => {
   bestOf = bo || 5;
   maxPlayers = mp || 2;
   playerOrder = players;
-  myId = socket.id;
 
-  // Init score tracking
   scores = {};
   allTimeScores = {};
   playerOrder.forEach(id => { scores[id] = 0; allTimeScores[id] = 0; });
@@ -110,58 +103,55 @@ socket.on('game_start', async ({ bestOf: bo, players, maxPlayers: mp }) => {
   initFaceDetection();
   initAudioDetection();
 
-  // Mesh: connect to every player with lower index (they initiate to higher)
-  const myIndex = playerOrder.indexOf(myId);
+  // WebRTC mesh: player at index I offers to all players at index < I.
+  // Lower-index players wait for the offer — no races, exactly one offerer per pair.
+  const myIndex = playerOrder.indexOf(me());
   for (let i = 0; i < myIndex; i++) {
-    const peerId = playerOrder[i];
-    await createPeerConnection(peerId, true); // we offer
+    await offerTo(playerOrder[i]);
   }
-  // Players with higher index wait for offer
-  // Signal readiness
-  socket.emit('game_event', { code: roomCode, type: 'player_ready', data: { id: myId } });
 
   beginPrepPhase();
 });
 
 socket.on('game_event', async ({ type, data, fromId }) => {
   switch (type) {
-    case 'player_ready': {
-      const theirIndex = playerOrder.indexOf(fromId);
-      const myIndex = playerOrder.indexOf(myId);
-      // If they have higher index than me, I offer to them
-      if (myIndex < theirIndex) {
-        await createPeerConnection(fromId, true);
-      }
-      break;
-    }
+
     case 'offer': {
-      await createPeerConnection(fromId, false);
-      await peers[fromId].pc.setRemoteDescription(new RTCSessionDescription(data));
-      const answer = await peers[fromId].pc.createAnswer();
-      await peers[fromId].pc.setLocalDescription(answer);
-      socket.emit('game_event', { code: roomCode, type: 'answer', data: { answer, targetId: fromId } });
+      const pc = getOrCreatePC(fromId);
+      await pc.setRemoteDescription(new RTCSessionDescription(data));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socket.emit('game_event', {
+        code: roomCode,
+        type: 'answer',
+        data: { sdp: answer, targetId: fromId }
+      });
       break;
     }
     case 'answer': {
-      const peer = peers[fromId];
-      if (peer) await peer.pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+      const pc = peers[fromId];
+      if (pc) await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
       break;
     }
     case 'ice': {
-      const peer = peers[fromId];
-      if (peer && data.candidate) await peer.pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+      const pc = peers[fromId];
+      if (pc && data.candidate) {
+        pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(() => {});
+      }
       break;
     }
+
     case 'i_laughed':
       handlePlayerLaughed(fromId);
       break;
+
     case 'next_round_ready':
-      // All peers need to confirm before starting
       handleNextRoundVote(fromId);
       break;
+
     case 'rematch_vote': {
       const btn = document.getElementById('next-btn');
-      if (btn) btn.textContent = 'rematch (' + data.votes + '/' + data.needed + ')...';
+      if (btn) btn.textContent = 'waiting (' + data.votes + '/' + data.needed + ')...';
       break;
     }
     case 'rematch_go':
@@ -172,41 +162,26 @@ socket.on('game_event', async ({ type, data, fromId }) => {
 });
 
 socket.on('opponent_left', ({ id }) => {
-  // Remove their video slot
   const slot = document.getElementById('cam-slot-' + id);
   if (slot) slot.remove();
-  if (peers[id]) { peers[id].pc.close(); delete peers[id]; }
+  if (peers[id]) { peers[id].close(); delete peers[id]; }
   playerOrder = playerOrder.filter(p => p !== id);
   alert('A player disconnected.');
   goLobby();
 });
 
-// ─── Next-round vote tracking ─────────────────────────────
-let nextRoundVotes = new Set();
-
-function handleNextRoundVote(fromId) {
-  nextRoundVotes.add(fromId);
-  // Need all OTHER players to confirm
-  const others = playerOrder.filter(id => id !== myId);
-  if (others.every(id => nextRoundVotes.has(id))) {
-    nextRoundVotes.clear();
-    beginPrepPhase();
-  }
-}
-
-// ─── WebRTC mesh ──────────────────────────────────────────
-async function createPeerConnection(peerId, isOfferer) {
-  if (peers[peerId]) return; // already exists
+// ─── WebRTC helpers ───────────────────────────────────────
+function getOrCreatePC(peerId) {
+  if (peers[peerId]) return peers[peerId];
 
   const pc = new RTCPeerConnection(RTC_CONFIG);
-  peers[peerId] = { pc, stream: null };
+  peers[peerId] = pc;
 
   if (localStream) {
     localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
   }
 
   pc.ontrack = (e) => {
-    peers[peerId].stream = e.streams[0];
     const vid = document.getElementById('video-' + peerId);
     if (vid) {
       vid.srcObject = e.streams[0];
@@ -223,16 +198,29 @@ async function createPeerConnection(peerId, isOfferer) {
     });
   };
 
-  pc.oniceconnectionstatechange = () => console.log(peerId, 'ICE:', pc.iceConnectionState);
+  return pc;
+}
 
-  if (isOfferer) {
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    socket.emit('game_event', {
-      code: roomCode,
-      type: 'offer',
-      data: { ...offer, targetId: peerId }
-    });
+async function offerTo(peerId) {
+  const pc = getOrCreatePC(peerId);
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  socket.emit('game_event', {
+    code: roomCode,
+    type: 'offer',
+    data: { ...offer, targetId: peerId }
+  });
+}
+
+// ─── Camera ───────────────────────────────────────────────
+async function startCamera() {
+  if (localStream) return;
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    const vid = document.getElementById('video-' + me());
+    if (vid) { vid.srcObject = localStream; vid.muted = true; hideOverlay('overlay-' + me()); }
+  } catch (e) {
+    console.warn('Camera unavailable:', e);
   }
 }
 
@@ -243,7 +231,8 @@ function buildCamGrid(players) {
   cams.className = 'cams players-' + players.length;
 
   players.forEach((id, i) => {
-    const isMe = id === myId;
+    const isMe = id === me();
+
     const wrap = document.createElement('div');
     wrap.className = 'cam-wrap';
     wrap.id = 'cam-slot-' + id;
@@ -252,21 +241,21 @@ function buildCamGrid(players) {
     vid.id = 'video-' + id;
     vid.autoplay = true;
     vid.playsinline = true;
-    if (isMe) vid.muted = true;
+    if (isMe) {
+      vid.muted = true;
+      if (localStream) vid.srcObject = localStream;
+    }
 
     const overlay = document.createElement('div');
     overlay.className = 'cam-overlay';
     overlay.id = 'overlay-' + id;
     overlay.textContent = isMe ? '📷' : '⏳';
+    if (isMe && localStream) { overlay.style.opacity = '0'; overlay.style.display = 'none'; }
 
     const label = document.createElement('div');
     label.className = 'cam-label' + (isMe ? ' you' : '');
     label.id = 'cam-label-' + id;
-    if (isMe) {
-      label.innerHTML = '<span class="live-dot"></span>you';
-    } else {
-      label.textContent = 'player ' + (i + 1);
-    }
+    label.innerHTML = isMe ? '<span class="live-dot"></span>you' : 'player ' + (i + 1);
 
     const laughBadge = document.createElement('div');
     laughBadge.className = 'laugh-badge';
@@ -279,31 +268,6 @@ function buildCamGrid(players) {
     wrap.appendChild(laughBadge);
     cams.appendChild(wrap);
   });
-
-  // Hook up local video
-  if (localStream) {
-    const localVid = document.getElementById('video-' + myId);
-    if (localVid) {
-      localVid.srcObject = localStream;
-      hideOverlay('overlay-' + myId);
-    }
-  }
-}
-
-// ─── Camera ───────────────────────────────────────────────
-async function startCamera() {
-  if (localStream) return;
-  try {
-    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    const localVid = document.getElementById('video-' + myId);
-    if (localVid) {
-      localVid.srcObject = localStream;
-      localVid.muted = true;
-      hideOverlay('overlay-' + myId);
-    }
-  } catch (e) {
-    console.warn('Camera unavailable:', e);
-  }
 }
 
 // ─── Audio Detection ──────────────────────────────────────
@@ -325,20 +289,13 @@ function initAudioDetection() {
     const pulseHistory = [];
     let lastEnergyState = false;
     let audioLaughConfidence = 0;
-
     window._getAudioConfidence = () => audioLaughConfidence;
 
     const audioLoop = () => {
       if (!audioCtx) return;
       analyser.getByteFrequencyData(dataArray);
       const totalAvg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-
-      if (totalAvg < 20) {
-        audioLaughConfidence = 0;
-        lastEnergyState = false;
-        requestAnimationFrame(audioLoop);
-        return;
-      }
+      if (totalAvg < 20) { audioLaughConfidence = 0; lastEnergyState = false; requestAnimationFrame(audioLoop); return; }
 
       let bandSum = 0;
       for (let i = laughLow; i <= laughHigh; i++) bandSum += dataArray[i];
@@ -349,7 +306,6 @@ function initAudioDetection() {
       const isHigh = bandAvg > 45;
       if (isHigh && !lastEnergyState) pulseHistory.push(now);
       lastEnergyState = isHigh;
-
       const cutoff = now - 500;
       while (pulseHistory.length && pulseHistory[0] < cutoff) pulseHistory.shift();
       const pulseCount = pulseHistory.length;
@@ -362,17 +318,12 @@ function initAudioDetection() {
         if (audioLaughConfidence >= LAUGH_THRESHOLD_AUDIO_CONFIRM) {
           if (!laughStartTime) laughStartTime = now;
           else if (now - laughStartTime > LAUGH_SUSTAIN_MS) triggerLaugh();
-        } else {
-          laughStartTime = null;
-        }
+        } else { laughStartTime = null; }
       }
-
       requestAnimationFrame(audioLoop);
     };
     requestAnimationFrame(audioLoop);
-  } catch (e) {
-    console.warn('Audio detection unavailable:', e);
-  }
+  } catch (e) { console.warn('Audio detection unavailable:', e); }
 }
 
 // ─── Face Detection ───────────────────────────────────────
@@ -386,19 +337,11 @@ function initFaceDetection() {
     faceMesh = new FaceMesh({
       locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4/${file}`
     });
-    faceMesh.setOptions({
-      maxNumFaces: 1,
-      refineLandmarks: true,
-      minDetectionConfidence: 0.5,
-      minTrackingConfidence: 0.5
-    });
+    faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
     faceMesh.onResults(onFaceResults);
-    faceMesh.initialize().then(() => {
-      console.log('FaceMesh ready');
-      startDetectionLoop();
-    });
+    faceMesh.initialize().then(() => { console.log('FaceMesh ready'); startDetectionLoop(); });
   } catch (e) {
-    console.warn('FaceMesh failed, using manual mode');
+    console.warn('FaceMesh failed, manual mode');
     faceMesh = null;
     enableManualButton();
   }
@@ -421,21 +364,16 @@ function onFaceResults(results) {
   if (!results.multiFaceLandmarks || !results.multiFaceLandmarks.length) return;
   const lm = results.multiFaceLandmarks[0];
   const ratio = getLaughScore(lm);
-
   const threshold = baselineMouthRatio + LAUGH_THRESHOLD_OPEN_RATIO;
   const pct = Math.min((ratio / (threshold * 1.2)) * 100, 100);
   const bar = document.getElementById('mouth-indicator');
-  if (bar) {
-    bar.style.width = pct + '%';
-    bar.style.background = ratio > threshold ? 'var(--danger)' : 'var(--accent)';
-  }
+  if (bar) { bar.style.width = pct + '%'; bar.style.background = ratio > threshold ? 'var(--danger)' : 'var(--accent)'; }
 
   if (calibrating) {
     calibrationSamples.push(ratio);
     if (calibrationSamples.length >= CALIBRATION_FRAMES) finishCalibration();
     return;
   }
-
   if (!laughDetectionActive || laughTriggered) return;
 
   const faceTriggered = ratio > threshold;
@@ -446,9 +384,7 @@ function onFaceResults(results) {
   if (strongFace || combined) {
     if (!laughStartTime) laughStartTime = Date.now();
     else if (Date.now() - laughStartTime > LAUGH_SUSTAIN_MS) triggerLaugh();
-  } else {
-    laughStartTime = null;
-  }
+  } else { laughStartTime = null; }
 }
 
 function startDetectionLoop() {
@@ -456,7 +392,7 @@ function startDetectionLoop() {
   detectionRunning = true;
   const loop = async () => {
     if (!faceMesh) return;
-    const video = document.getElementById('video-' + myId);
+    const video = document.getElementById('video-' + me());
     if (video && video.readyState >= 2) {
       detectionCtx.drawImage(video, 0, 0, 320, 240);
       await faceMesh.send({ image: detectionCanvas });
@@ -477,7 +413,7 @@ function triggerLaugh() {
   laughTriggered = true;
   laughDetectionActive = false;
   socket.emit('game_event', { code: roomCode, type: 'i_laughed' });
-  handlePlayerLaughed(myId);
+  handlePlayerLaughed(me());
 }
 
 function enableManualButton() {
@@ -487,44 +423,33 @@ function enableManualButton() {
   if (bar) bar.style.display = 'none';
 }
 
-// ─── Multiplayer round logic ──────────────────────────────
-// Round ends when all-but-one have laughed (last one standing wins)
-// OR in 2-player, first to laugh loses
-
+// ─── Round logic ──────────────────────────────────────────
 function handlePlayerLaughed(id) {
   if (!roundActive) return;
+  if (laughedThisRound.has(id)) return;
   laughedThisRound.add(id);
 
-  // Show laugh badge on their tile
   const badge = document.getElementById('laugh-badge-' + id);
   if (badge) badge.classList.add('visible');
 
   const activePlayers = playerOrder.filter(p => !laughedThisRound.has(p));
 
   if (maxPlayers === 2) {
-    // 1v1: first to laugh loses immediately
     endRound();
   } else {
-    // Multiplayer: last person standing wins
-    if (activePlayers.length === 1) {
-      endRound();
-    } else if (activePlayers.length === 0) {
-      // Everyone laughed simultaneously — no winner this round
-      endRound();
-    }
+    if (activePlayers.length <= 1) endRound();
   }
 }
 
 function endRound() {
+  if (!roundActive) return;
   roundActive = false;
   laughDetectionActive = false;
   stopTimer();
   document.getElementById('laugh-btn').disabled = true;
 
   const activePlayers = playerOrder.filter(p => !laughedThisRound.has(p));
-  // Winner: last standing, or nobody if all laughed
   const winnerId = activePlayers.length === 1 ? activePlayers[0] : null;
-
   if (winnerId) scores[winnerId] = (scores[winnerId] || 0) + 1;
   updateScoreHUD();
 
@@ -532,9 +457,7 @@ function endRound() {
   const matchWinner = playerOrder.find(id => (scores[id] || 0) >= winsNeeded);
 
   if (matchWinner) {
-    playerOrder.forEach(id => {
-      allTimeScores[id] = (allTimeScores[id] || 0) + (scores[id] || 0);
-    });
+    playerOrder.forEach(id => { allTimeScores[id] = (allTimeScores[id] || 0) + (scores[id] || 0); });
     showGameOver(matchWinner);
   } else {
     showRoundResult(winnerId);
@@ -542,21 +465,14 @@ function endRound() {
 }
 
 function showRoundResult(winnerId) {
-  const iWon = winnerId === myId;
+  const iWon = winnerId === me();
   const noWinner = winnerId === null;
-
-  document.getElementById('round-emoji').textContent  = noWinner ? '🤝' : iWon ? '🏆' : '😭';
-  document.getElementById('round-title').textContent  = noWinner ? 'everyone laughed' : iWon ? 'you held it!' : 'you laughed';
-  document.getElementById('round-title').className    = 'result-title ' + (iWon ? 'win' : noWinner ? '' : 'lose');
-  document.getElementById('round-sub').textContent    = noWinner ? 'no points awarded' : iWon ? 'you win the round' : (winnerId ? 'player ' + (playerOrder.indexOf(winnerId) + 1) + ' wins the round' : '');
-
-  // Show current scores
-  const scoreLines = playerOrder.map((id, i) => {
-    const label = id === myId ? 'you' : 'player ' + (i + 1);
-    return label + ': ' + (scores[id] || 0);
-  }).join('  ·  ');
-  document.getElementById('rs-you').textContent  = scores[myId] || 0;
-  document.getElementById('rs-them').textContent = playerOrder.filter(id => id !== myId).map(id => scores[id] || 0).join(' / ');
+  document.getElementById('round-emoji').textContent = noWinner ? '🤝' : iWon ? '🏆' : '😭';
+  document.getElementById('round-title').textContent = noWinner ? 'everyone laughed' : iWon ? 'you held it!' : 'you laughed';
+  document.getElementById('round-title').className   = 'result-title ' + (iWon ? 'win' : noWinner ? '' : 'lose');
+  document.getElementById('round-sub').textContent   = noWinner ? 'no points awarded' : iWon ? 'you win the round' : (winnerId ? 'player ' + (playerOrder.indexOf(winnerId) + 1) + ' wins the round' : '');
+  document.getElementById('rs-you').textContent  = scores[me()] || 0;
+  document.getElementById('rs-them').textContent = playerOrder.filter(id => id !== me()).map(id => scores[id] || 0).join(' / ');
 
   const btn = document.getElementById('next-btn');
   btn.disabled = false;
@@ -566,28 +482,34 @@ function showRoundResult(winnerId) {
 }
 
 function showGameOver(winnerId) {
-  const iWon = winnerId === myId;
+  const iWon = winnerId === me();
   document.getElementById('over-emoji').textContent = iWon ? '🏆' : '😭';
   document.getElementById('over-title').textContent = iWon ? 'you win!' : 'you lose';
   document.getElementById('over-title').className   = 'result-title ' + (iWon ? 'win' : 'lose');
-
-  const allTimeMe = allTimeScores[myId] || 0;
-  const allTimeOthers = playerOrder.filter(id => id !== myId).map(id => allTimeScores[id] || 0).join(' / ');
-  document.getElementById('os-you').textContent  = allTimeMe;
-  document.getElementById('os-them').textContent = allTimeOthers;
+  const allTimeMe     = allTimeScores[me()] || 0;
+  const allTimeOthers = playerOrder.filter(id => id !== me()).map(id => allTimeScores[id] || 0).join(' / ');
+  document.getElementById('os-you').textContent   = allTimeMe;
+  document.getElementById('os-them').textContent  = allTimeOthers;
   document.getElementById('over-sub').textContent = 'all time · you ' + allTimeMe + ' vs ' + allTimeOthers;
-
   showScreen('over');
+}
+
+// ─── Next round voting ────────────────────────────────────
+function handleNextRoundVote(fromId) {
+  nextRoundVotes.add(fromId);
+  const others = playerOrder.filter(id => id !== me());
+  if (others.every(id => nextRoundVotes.has(id))) {
+    nextRoundVotes.clear();
+    beginPrepPhase();
+  }
 }
 
 function requestNextRound() {
   const btn = document.getElementById('next-btn');
   btn.disabled = true;
   btn.textContent = 'waiting for others...';
-  nextRoundVotes.add(myId);
-
-  // Check if I'm the last one needed
-  const others = playerOrder.filter(id => id !== myId);
+  nextRoundVotes.add(me());
+  const others = playerOrder.filter(id => id !== me());
   if (others.every(id => nextRoundVotes.has(id))) {
     nextRoundVotes.clear();
     beginPrepPhase();
@@ -599,7 +521,7 @@ function requestNextRound() {
 function requestRematch() {
   const btn = document.getElementById('next-btn');
   btn.disabled = true;
-  btn.textContent = 'waiting (' + 1 + '/' + playerOrder.length + ')...';
+  btn.textContent = 'waiting (1/' + playerOrder.length + ')...';
   socket.emit('game_event', { code: roomCode, type: 'rematch_request' });
 }
 
@@ -610,12 +532,10 @@ async function resetGame() {
   nextRoundVotes.clear();
   updateScoreHUD();
 
-  // Close and rebuild all peer connections
-  for (const id in peers) { peers[id].pc.close(); }
+  for (const id in peers) { peers[id].close(); }
   peers = {};
 
-  // Reset remote video overlays
-  playerOrder.filter(id => id !== myId).forEach(id => {
+  playerOrder.filter(id => id !== me()).forEach(id => {
     const vid = document.getElementById('video-' + id);
     if (vid) vid.srcObject = null;
     const ol = document.getElementById('overlay-' + id);
@@ -630,15 +550,13 @@ async function resetGame() {
 
   await new Promise(res => setTimeout(res, 800));
 
-  // Rebuild mesh
-  const myIndex = playerOrder.indexOf(myId);
+  const myIndex = playerOrder.indexOf(me());
   for (let i = 0; i < myIndex; i++) {
-    await createPeerConnection(playerOrder[i], true);
+    await offerTo(playerOrder[i]);
   }
-  socket.emit('game_event', { code: roomCode, type: 'player_ready', data: { id: myId } });
 }
 
-// ─── Game Flow ────────────────────────────────────────────
+// ─── Game flow ────────────────────────────────────────────
 function beginPrepPhase() {
   roundActive = false;
   laughDetectionActive = false;
@@ -647,7 +565,6 @@ function beginPrepPhase() {
   laughedThisRound.clear();
   document.getElementById('laugh-btn').disabled = true;
 
-  // Clear laugh badges
   playerOrder.forEach(id => {
     const badge = document.getElementById('laugh-badge-' + id);
     if (badge) badge.classList.remove('visible');
@@ -658,10 +575,7 @@ function beginPrepPhase() {
   updateTimerDisplay();
   setStatus('', false);
 
-  if (faceMesh) {
-    calibrating = true;
-    calibrationSamples = [];
-  }
+  if (faceMesh) { calibrating = true; calibrationSamples = []; }
 
   playerOrder.forEach(id => {
     const vid = document.getElementById('video-' + id);
@@ -680,12 +594,10 @@ function beginPrepPhase() {
 function runCountdown(steps, onDone) {
   const existing = document.getElementById('countdown-overlay');
   if (existing) existing.remove();
-
   const overlay = document.createElement('div');
   overlay.className = 'countdown-overlay';
   overlay.id = 'countdown-overlay';
   document.body.appendChild(overlay);
-
   let i = 0;
   const showNext = () => {
     if (i >= steps.length) { overlay.remove(); onDone(); return; }
@@ -734,17 +646,15 @@ function updateTimerDisplay() {
 function iLaughed() {
   if (!roundActive) return;
   socket.emit('game_event', { code: roomCode, type: 'i_laughed' });
-  handlePlayerLaughed(myId);
+  handlePlayerLaughed(me());
 }
 
 function updateScoreHUD() {
-  const myScore = scores[myId] || 0;
-  const othersScore = playerOrder.filter(id => id !== myId).map(id => scores[id] || 0).join('/');
-  document.getElementById('score-you').textContent  = myScore;
-  document.getElementById('score-them').textContent = othersScore;
+  document.getElementById('score-you').textContent  = scores[me()] || 0;
+  document.getElementById('score-them').textContent = playerOrder.filter(id => id !== me()).map(id => scores[id] || 0).join('/');
 }
 
-// ─── Selectors ────────────────────────────────────────────
+// ─── Lobby selectors ──────────────────────────────────────
 function setBestOf(n) {
   selectedBestOf = n;
   [1, 3, 5].forEach(v => {
@@ -769,10 +679,7 @@ function setStatus(msg, highlight = false) {
 }
 
 function showScreen(id) {
-  document.querySelectorAll('.screen').forEach(s => {
-    s.classList.remove('active');
-    s.style.display = 'none';
-  });
+  document.querySelectorAll('.screen').forEach(s => { s.classList.remove('active'); s.style.display = 'none'; });
   const el = document.getElementById('screen-' + id);
   el.style.display = '';
   el.classList.add('active');
@@ -809,7 +716,7 @@ function cleanup() {
   calibrating = false;
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
-  for (const id in peers) { peers[id].pc.close(); }
+  for (const id in peers) { peers[id].close(); }
   peers = {};
   if (faceMesh) { faceMesh.close(); faceMesh = null; }
   window._getAudioConfidence = null;
