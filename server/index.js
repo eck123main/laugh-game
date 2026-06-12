@@ -14,12 +14,20 @@ const rooms = {};
 io.on('connection', (socket) => {
   console.log('connected:', socket.id);
 
-  socket.on('create_room', (code) => {
-    rooms[code] = { host: socket.id, guest: null, rematchVotes: 0 };
-    socket.join(code);
-    socket.emit('room_created', code);
-  });
+// Replace the create_room handler:
+socket.on('create_room', ({ code, bestOf }) => {
+  rooms[code] = { host: socket.id, guest: null, rematchVotes: 0, bestOf: bestOf || 5 };
+  socket.join(code);
+  socket.emit('room_created', code);
+});
 
+// Replace game_start emit inside join_room:
+setTimeout(() => {
+  io.to(code).emit('game_start', { bestOf: room.bestOf });
+}, 500);
+
+// Replace rematch_go emit:
+io.to(code).emit('game_event', { type: 'rematch_go', data: { bestOf: room.bestOf } });
   socket.on('join_room', (code) => {
     const room = rooms[code];
     if (!room) return socket.emit('error', 'Room not found');

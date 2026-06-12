@@ -21,6 +21,12 @@
   <div class="logo"><span>o</span>giggle</div>
   <div class="tagline">1v1 laugh detection</div>
   <div class="lobby-actions">
+    <div style="display:flex;gap:8px;margin-bottom:4px;">
+  <span style="font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:2px;align-self:center;text-transform:uppercase;white-space:nowrap;">best of</span>
+  <button class="btn" id="bo-1" onclick="setBestOf(1)" style="padding:8px;font-size:11px;">1</button>
+  <button class="btn" id="bo-3" onclick="setBestOf(3)" style="padding:8px;font-size:11px;">3</button>
+  <button class="btn primary" id="bo-5" onclick="setBestOf(5)" style="padding:8px;font-size:11px;">5</button>
+</div>
     <button class="btn primary" onclick="createRoom()">create room</button>
     <div class="divider"></div>
     <div class="input-row">

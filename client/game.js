@@ -23,10 +23,9 @@ const RTC_CONFIG = {
 const LAUGH_SUSTAIN_MS = 1000;
 const CALIBRATION_FRAMES = 80;
 
-// Shared detection config — same for both players, no per-player sensitivity
-const LAUGH_THRESHOLD_OPEN_RATIO    = 0.22;  // jaw drop needed to count as laugh
-const LAUGH_THRESHOLD_AUDIO_CONFIRM = 0.6;   // audio confidence needed solo (no face)
-const LAUGH_THRESHOLD_AUDIO_ASSIST  = 0.35;  // audio needed when face also active
+const LAUGH_THRESHOLD_OPEN_RATIO    = 0.22;
+const LAUGH_THRESHOLD_AUDIO_CONFIRM = 0.6;
+const LAUGH_THRESHOLD_AUDIO_ASSIST  = 0.35;
 
 // ─── State ────────────────────────────────────────────────
 let socket, pc, localStream;
@@ -35,6 +34,9 @@ let isHost = false;
 let timerInterval = null;
 let timerSecs = 0;
 let scoreYou = 0, scoreThem = 0;
+let totalYou = 0, totalThem = 0;
+let bestOf = 5;
+let selectedBestOf = 5;
 let roundActive = false;
 let audioCtx = null;
 
@@ -48,6 +50,16 @@ let calibrating = false;
 let calibrationSamples = [];
 let detectionCanvas, detectionCtx;
 let detectionRunning = false;
+
+// ─── Best-of selector ─────────────────────────────────────
+function setBestOf(n) {
+  selectedBestOf = n;
+  [1, 3, 5].forEach(v => {
+    const btn = document.getElementById('bo-' + v);
+    if (!btn) return;
+    btn.className = 'btn' + (v === n ? ' primary' : '');
+  });
+}
 
 // ─── Socket ───────────────────────────────────────────────
 socket = io();
@@ -69,7 +81,8 @@ socket.on('error', (msg) => {
   document.getElementById('lobby-error').textContent = msg;
 });
 
-socket.on('game_start', async () => {
+socket.on('game_start', async ({ bestOf: bo } = {}) => {
+  bestOf = bo || 5;
   await startCamera();
   await setupPeerConnection();
   showScreen('game');
@@ -107,6 +120,9 @@ socket.on('game_event', async ({ type, data }) => {
     case 'i_laughed':
       endRound(true);
       break;
+    case 'next_round_ready':
+      beginPrepPhase();
+      break;
     case 'rematch_request': {
       const btn = document.getElementById('next-btn');
       btn.disabled = false;
@@ -115,6 +131,7 @@ socket.on('game_event', async ({ type, data }) => {
       break;
     }
     case 'rematch_go':
+      if (data?.bestOf) bestOf = data.bestOf;
       resetGame();
       break;
   }
@@ -164,7 +181,7 @@ async function startCamera() {
   }
 }
 
-// ─── Audio Detection (chuckle-pattern aware) ─────────────
+// ─── Audio Detection ──────────────────────────────────────
 function initAudioDetection() {
   if (!localStream || audioCtx) return;
   try {
@@ -180,10 +197,9 @@ function initAudioDetection() {
     const laughLow  = Math.floor(300  / binHz);
     const laughHigh = Math.ceil(3000  / binHz);
 
-    // Pulse (chuckle burst) detection
     const pulseHistory = [];
     let lastEnergyState = false;
-    let audioLaughConfidence = 0; // 0.0 – 1.0
+    let audioLaughConfidence = 0;
 
     window._getAudioConfidence = () => audioLaughConfidence;
 
@@ -200,13 +216,11 @@ function initAudioDetection() {
         return;
       }
 
-      // Spectral band ratio — laughter concentrates energy at 300–3000 Hz
       let bandSum = 0;
       for (let i = laughLow; i <= laughHigh; i++) bandSum += dataArray[i];
-      const bandAvg  = bandSum / (laughHigh - laughLow + 1);
+      const bandAvg   = bandSum / (laughHigh - laughLow + 1);
       const bandRatio = bandAvg / (totalAvg + 1);
 
-      // Chuckle pulse counting — rising edges in 500ms window
       const now = Date.now();
       const isHigh = bandAvg > 45;
       if (isHigh && !lastEnergyState) pulseHistory.push(now);
@@ -216,12 +230,10 @@ function initAudioDetection() {
       while (pulseHistory.length && pulseHistory[0] < cutoff) pulseHistory.shift();
       const pulseCount = pulseHistory.length;
 
-      // Confidence: spectral shape good + pulse rate in laughter range (2–8 per 500ms)
       const spectralOk = bandRatio > 0.5;
       const rhythmOk   = pulseCount >= 2 && pulseCount <= 8;
       audioLaughConfidence = (spectralOk ? 0.5 : 0) + (rhythmOk ? 0.5 : 0);
 
-      // Audio-only trigger path (used when faceMesh unavailable)
       if (laughDetectionActive && !laughTriggered && !faceMesh) {
         if (audioLaughConfidence >= LAUGH_THRESHOLD_AUDIO_CONFIRM) {
           if (!laughStartTime) laughStartTime = now;
@@ -277,7 +289,7 @@ function getLaughScore(lm) {
   const ratio = openH / openW;
   const cornerMidY = (lm[LEFT_CORNER].y + lm[RIGHT_CORNER].y) / 2;
   const jawDrop = lm[LOWER_LIP].y - cornerMidY;
-  if (jawDrop < 0.01) return 0; // smile without jaw drop won't pass
+  if (jawDrop < 0.01) return 0;
   return ratio;
 }
 
@@ -305,9 +317,7 @@ function onFaceResults(results) {
   const faceTriggered = ratio > threshold;
   const audioConf = window._getAudioConfidence ? window._getAudioConfidence() : 0;
 
-  // Very strong face signal alone can trigger (silent laugh)
   const strongFace = ratio > (baselineMouthRatio + LAUGH_THRESHOLD_OPEN_RATIO * 1.5);
-  // Normal face + some audio confirmation
   const combined   = faceTriggered && audioConf >= LAUGH_THRESHOLD_AUDIO_ASSIST;
 
   if (strongFace || combined) {
@@ -355,7 +365,6 @@ function enableManualButton() {
   if (bar) bar.style.display = 'none';
 }
 
-// no-op — sensitivity removed, thresholds are fixed and consistent for both players
 function setSensitivity(val) {}
 
 // ─── Game Flow ────────────────────────────────────────────
@@ -368,23 +377,54 @@ function beginPrepPhase() {
   stopTimer();
   timerSecs = 0;
   updateTimerDisplay();
+  setStatus('', false);
 
   if (faceMesh) {
     calibrating = true;
     calibrationSamples = [];
   }
 
-  let count = 5;
-  setStatus(count + '...', true);
-  const cd = setInterval(() => {
-    count--;
-    if (count > 0) {
-      setStatus(count + '...', true);
-    } else {
-      clearInterval(cd);
-      goRound();
+  document.getElementById('video-local').className = 'blurred';
+  document.getElementById('video-remote').className = 'blurred';
+
+  runCountdown([3, 2, 1, 'GO'], () => {
+    document.getElementById('video-local').className = 'unblurred';
+    document.getElementById('video-remote').className = 'unblurred';
+    goRound();
+  });
+}
+
+function runCountdown(steps, onDone) {
+  const existing = document.getElementById('countdown-overlay');
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.className = 'countdown-overlay';
+  overlay.id = 'countdown-overlay';
+  document.body.appendChild(overlay);
+
+  let i = 0;
+
+  const showNext = () => {
+    if (i >= steps.length) {
+      overlay.remove();
+      onDone();
+      return;
     }
-  }, 1000);
+
+    const val = steps[i];
+    i++;
+
+    overlay.innerHTML = '';
+    const el = document.createElement('div');
+    el.className = 'countdown-number' + (val === 'GO' ? ' go' : '');
+    el.textContent = val;
+    overlay.appendChild(el);
+
+    setTimeout(showNext, 900);
+  };
+
+  showNext();
 }
 
 function goRound() {
@@ -431,21 +471,53 @@ function endRound(iWon) {
   laughDetectionActive = false;
   stopTimer();
   document.getElementById('laugh-btn').disabled = true;
+
   if (iWon) scoreYou++; else scoreThem++;
   updateScores();
 
+  const winsNeeded = Math.ceil(bestOf / 2);
+  const matchOver = scoreYou >= winsNeeded || scoreThem >= winsNeeded;
+
+  if (matchOver) {
+    totalYou += scoreYou;
+    totalThem += scoreThem;
+    showGameOver(scoreYou > scoreThem);
+  } else {
+    showRoundResult(iWon);
+  }
+}
+
+function showRoundResult(iWon) {
   document.getElementById('round-emoji').textContent  = iWon ? '🏆' : '😭';
   document.getElementById('round-title').textContent  = iWon ? 'they laughed!' : 'you laughed';
   document.getElementById('round-title').className    = 'result-title ' + (iWon ? 'win' : 'lose');
-  document.getElementById('round-sub').textContent    = iWon ? 'you held it together' : 'opponent wins';
+  document.getElementById('round-sub').textContent    = iWon ? 'you held it together' : 'opponent wins the round';
   document.getElementById('rs-you').textContent  = scoreYou;
   document.getElementById('rs-them').textContent = scoreThem;
 
   const btn = document.getElementById('next-btn');
   btn.disabled = false;
-  btn.textContent = 'rematch?';
-  btn.onclick = requestRematch;
+  btn.textContent = 'next round →';
+  btn.onclick = requestNextRound;
   showScreen('round');
+}
+
+function showGameOver(iWon) {
+  document.getElementById('over-emoji').textContent = iWon ? '🏆' : '😭';
+  document.getElementById('over-title').textContent = iWon ? 'you win' : 'you lose';
+  document.getElementById('over-title').className   = 'result-title ' + (iWon ? 'win' : 'lose');
+  document.getElementById('os-you').textContent  = totalYou;
+  document.getElementById('os-them').textContent = totalThem;
+  document.getElementById('over-sub').textContent =
+    'all time · ' + totalYou + '–' + totalThem;
+  showScreen('over');
+}
+
+function requestNextRound() {
+  const btn = document.getElementById('next-btn');
+  btn.disabled = true;
+  btn.textContent = 'waiting for opponent...';
+  socket.emit('game_event', { code: roomCode, type: 'next_round_ready' });
 }
 
 function requestRematch() {
@@ -457,6 +529,7 @@ function requestRematch() {
 
 async function resetGame() {
   scoreYou = 0; scoreThem = 0;
+  // totalYou / totalThem intentionally preserved across rematches
   laughTriggered = false;
   updateScores();
 
@@ -512,7 +585,7 @@ function hideOverlay(id) {
 function createRoom() {
   document.getElementById('lobby-error').textContent = '';
   const code = Math.random().toString(36).substring(2, 6).toUpperCase();
-  socket.emit('create_room', code);
+  socket.emit('create_room', { code, bestOf: selectedBestOf });
 }
 
 function joinRoom() {
@@ -535,7 +608,9 @@ function cleanup() {
   if (pc) { pc.close(); pc = null; }
   if (faceMesh) { faceMesh.close(); faceMesh = null; }
   window._getAudioConfidence = null;
-  roomCode = null; scoreYou = 0; scoreThem = 0;
+  roomCode = null;
+  scoreYou = 0; scoreThem = 0;
+  totalYou = 0; totalThem = 0;
   ['overlay-local', 'overlay-remote'].forEach(id => {
     const el = document.getElementById(id);
     if (el) { el.style.display = ''; el.style.opacity = '1'; }
@@ -553,66 +628,4 @@ document.addEventListener('keydown', e => {
     e.preventDefault();
     if (!document.getElementById('laugh-btn').disabled) iLaughed();
   }
-function beginPrepPhase() {
-  roundActive = false;
-  laughDetectionActive = false;
-  laughTriggered = false;
-  laughStartTime = null;
-  document.getElementById('laugh-btn').disabled = true;
-  stopTimer();
-  timerSecs = 0;
-  updateTimerDisplay();
-  setStatus('', false);
-
-  if (faceMesh) {
-    calibrating = true;
-    calibrationSamples = [];
-  }
-
-  // Blur both videos
-  document.getElementById('video-local').className = 'blurred';
-  document.getElementById('video-remote').className = 'blurred';
-
-  runCountdown([3, 2, 1, 'GO'], () => {
-    // Unblur on GO
-    document.getElementById('video-local').className = 'unblurred';
-    document.getElementById('video-remote').className = 'unblurred';
-    goRound();
-  });
-}
-
-function runCountdown(steps, onDone) {
-  // Remove any existing overlay
-  const existing = document.getElementById('countdown-overlay');
-  if (existing) existing.remove();
-
-  const overlay = document.createElement('div');
-  overlay.className = 'countdown-overlay';
-  overlay.id = 'countdown-overlay';
-  document.body.appendChild(overlay);
-
-  let i = 0;
-
-  const showNext = () => {
-    if (i >= steps.length) {
-      overlay.remove();
-      onDone();
-      return;
-    }
-
-    const val = steps[i];
-    i++;
-
-    // Clear and show new number
-    overlay.innerHTML = '';
-    const el = document.createElement('div');
-    el.className = 'countdown-number' + (val === 'GO' ? ' go' : '');
-    el.textContent = val;
-    overlay.appendChild(el);
-
-    setTimeout(showNext, 900);
-  };
-
-  showNext();
-}
 });
