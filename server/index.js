@@ -14,20 +14,12 @@ const rooms = {};
 io.on('connection', (socket) => {
   console.log('connected:', socket.id);
 
-// Replace the create_room handler:
-socket.on('create_room', ({ code, bestOf }) => {
-  rooms[code] = { host: socket.id, guest: null, rematchVotes: 0, bestOf: bestOf || 5 };
-  socket.join(code);
-  socket.emit('room_created', code);
-});
+  socket.on('create_room', ({ code, bestOf }) => {
+    rooms[code] = { host: socket.id, guest: null, rematchVotes: 0, bestOf: bestOf || 5 };
+    socket.join(code);
+    socket.emit('room_created', code);
+  });
 
-// Replace game_start emit inside join_room:
-setTimeout(() => {
-  io.to(code).emit('game_start', { bestOf: room.bestOf });
-}, 500);
-
-// Replace rematch_go emit:
-io.to(code).emit('game_event', { type: 'rematch_go', data: { bestOf: room.bestOf } });
   socket.on('join_room', (code) => {
     const room = rooms[code];
     if (!room) return socket.emit('error', 'Room not found');
@@ -36,7 +28,7 @@ io.to(code).emit('game_event', { type: 'rematch_go', data: { bestOf: room.bestOf
     socket.join(code);
     socket.emit('room_joined', code);
     setTimeout(() => {
-      io.to(code).emit('game_start');
+      io.to(code).emit('game_start', { bestOf: room.bestOf });
     }, 500);
   });
 
@@ -48,9 +40,8 @@ io.to(code).emit('game_event', { type: 'rematch_go', data: { bestOf: room.bestOf
       room.rematchVotes = (room.rematchVotes || 0) + 1;
       if (room.rematchVotes >= 2) {
         room.rematchVotes = 0;
-        io.to(code).emit('game_event', { type: 'rematch_go' });
+        io.to(code).emit('game_event', { type: 'rematch_go', data: { bestOf: room.bestOf } });
       } else {
-        // tell the other person their opponent wants a rematch
         socket.to(code).emit('game_event', { type: 'rematch_request' });
       }
     } else {
