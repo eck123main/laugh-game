@@ -536,6 +536,7 @@ async function resetGame() {
 
 // ─── Game flow ────────────────────────────────────────────
 function beginPrepPhase() {
+  showScreen('game');
   roundActive = false;
   laughDetectionActive = false;
   laughTriggered = false;
