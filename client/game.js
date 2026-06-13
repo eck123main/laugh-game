@@ -30,7 +30,7 @@ const FACE_WEIGHT                 = 0.55;
 const AUDIO_WEIGHT                = 0.45;
 const COMBINED_TRIGGER_THRESHOLD  = 0.62;
 const FACE_SOLO_THRESHOLD         = 0.80;
-const AUDIO_SOLO_THRESHOLD        = 0.85;
+const AUDIO_SOLO_THRESHOLD        = 0.75;  // Lowered: ResNet is more accurate than heuristic
 
 // ─── State ────────────────────────────────────────────────
 let localStream;
@@ -40,33 +40,34 @@ const socket = io();
 const me = () => socket.id;
 
 let peers = {};
-let playerOrder = [];    // all players (including eliminated/spectators)
-let maxPlayers = 2;
-let bestOf = 5;
+let playerOrder    = [];
+let maxPlayers     = 2;
+let bestOf         = 5;
 let selectedBestOf = 5;
 let selectedMaxPlayers = 2;
-let selectedGameMode = 'standard';  // 'standard' | 'elimination'
-let gameMode = 'standard';
+let selectedGameMode   = 'standard';
+let gameMode           = 'standard';
 
 // Elimination state
-let activePlayers = [];      // players still competing
-let eliminatedPlayers = [];  // players knocked out (spectators)
-let eliminationFinals = false;  // true when we're down to 2 in elimination mode
+let activePlayers     = [];
+let eliminatedPlayers = [];
+let eliminationFinals = false;
 
 let timerInterval = null;
-let timerSecs = 0;
+let timerSecs     = 0;
 
-let scores = {};
+let scores        = {};
 let allTimeScores = {};
 
-let laughedThisRound = new Set();
-let roundActive = false;
-let audioCtx = null;
+let laughedThisRound     = new Set();
+let roundActive          = false;
+let audioCtx             = null;
+let scriptProcessor      = null;   // kept so we can disconnect on cleanup
 
-let faceMesh = null;
+let faceMesh             = null;
 let laughDetectionActive = false;
-let laughStartTime = null;
-let laughTriggered = false;
+let laughStartTime       = null;
+let laughTriggered       = false;
 
 let baselineMouth  = 0.025;
 let baselineCheek  = 0;
@@ -78,6 +79,164 @@ let detectionCanvas, detectionCtx;
 let detectionRunning = false;
 
 let _audioLaughConfidence = 0;
+
+// ─── ResNet ONNX model state ──────────────────────────────
+let onnxSession    = null;   // ort.InferenceSession once loaded
+let onnxReady      = false;  // true after model loads successfully
+let onnxRingBuffer = null;   // Float32Array ring buffer at 8 kHz
+let onnxWritePtr   = 0;
+let onnxFramesSinceInference = 0;
+
+const ONNX_SAMPLE_RATE = 8000;
+const ONNX_WINDOW_SIZE = 8000;   // 1-second window
+const ONNX_HOP_SIZE    = 800;    // run inference every 100 ms
+const ONNX_MODEL_PATH  = '/models/laughter_resnet.onnx';
+
+// ─── Mel spectrogram constants (match Gillick et al.) ─────
+const MEL_N_BINS   = 128;
+const MEL_WIN_SAMP = 200;   // 25 ms at 8 kHz
+const MEL_HOP_SAMP = 80;    // 10 ms at 8 kHz
+const MEL_F_MIN    = 60;
+const MEL_F_MAX    = 3800;
+
+// Pre-compute Hann window
+const HANN = new Float32Array(MEL_WIN_SAMP);
+for (let i = 0; i < MEL_WIN_SAMP; i++) {
+  HANN[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (MEL_WIN_SAMP - 1)));
+}
+
+// Pre-compute mel filterbank (MEL_N_BINS filters × (MEL_WIN_SAMP/2+1) FFT bins)
+const MEL_FILTERS = buildMelFilterbank(MEL_N_BINS, MEL_WIN_SAMP, ONNX_SAMPLE_RATE, MEL_F_MIN, MEL_F_MAX);
+
+function hzToMel(hz) { return 2595 * Math.log10(1 + hz / 700); }
+function melToHz(m)  { return 700 * (Math.pow(10, m / 2595) - 1); }
+
+function buildMelFilterbank(nFilters, winSamp, sr, fMin, fMax) {
+  const nFft  = winSamp;
+  const nBins = Math.floor(nFft / 2) + 1;
+  const melMin = hzToMel(fMin);
+  const melMax = hzToMel(fMax);
+
+  // nFilters + 2 evenly-spaced mel points → Hz → FFT bin indices
+  const melPoints = new Float32Array(nFilters + 2);
+  for (let i = 0; i < nFilters + 2; i++) {
+    melPoints[i] = melToHz(melMin + (melMax - melMin) * i / (nFilters + 1));
+  }
+  const binPoints = melPoints.map(hz => Math.floor((nFft + 1) * hz / sr));
+
+  // Build filter matrix as flat Float32Array[nFilters * nBins]
+  const filters = new Float32Array(nFilters * nBins);
+  for (let m = 1; m <= nFilters; m++) {
+    const lo  = binPoints[m - 1];
+    const ctr = binPoints[m];
+    const hi  = binPoints[m + 1];
+    for (let k = lo; k < ctr && k < nBins; k++) {
+      filters[(m - 1) * nBins + k] = (k - lo) / Math.max(ctr - lo, 1);
+    }
+    for (let k = ctr; k <= hi && k < nBins; k++) {
+      filters[(m - 1) * nBins + k] = (hi - k) / Math.max(hi - ctr, 1);
+    }
+  }
+  return { filters, nBins, nFilters };
+}
+
+// Real-valued FFT magnitude via DFT (good enough for 200-sample windows)
+function rfftMag(frame) {
+  const N    = frame.length;
+  const nOut = Math.floor(N / 2) + 1;
+  const mag  = new Float32Array(nOut);
+  for (let k = 0; k < nOut; k++) {
+    let re = 0, im = 0;
+    for (let n = 0; n < N; n++) {
+      const angle = -2 * Math.PI * k * n / N;
+      re += frame[n] * Math.cos(angle);
+      im += frame[n] * Math.sin(angle);
+    }
+    mag[k] = Math.sqrt(re * re + im * im);
+  }
+  return mag;
+}
+
+// Compute log mel spectrogram from a 1-second mono float32 clip at ONNX_SAMPLE_RATE
+// Returns Float32Array of shape [MEL_N_BINS × nFrames], row-major (bins fastest)
+function computeLogMelSpectrogram(audio) {
+  const nFrames = Math.floor((audio.length - MEL_WIN_SAMP) / MEL_HOP_SAMP) + 1;
+  const { filters, nBins, nFilters } = MEL_FILTERS;
+  // Output: [nFilters × nFrames], stored as [frame * nFilters + bin]
+  const spec = new Float32Array(nFilters * nFrames);
+
+  for (let f = 0; f < nFrames; f++) {
+    const start = f * MEL_HOP_SAMP;
+    // Windowed frame
+    const frame = new Float32Array(MEL_WIN_SAMP);
+    for (let i = 0; i < MEL_WIN_SAMP; i++) frame[i] = audio[start + i] * HANN[i];
+    // FFT magnitudes
+    const mag = rfftMag(frame);
+    // Apply mel filterbank
+    for (let m = 0; m < nFilters; m++) {
+      let energy = 0;
+      const offset = m * nBins;
+      for (let k = 0; k < nBins; k++) energy += filters[offset + k] * mag[k];
+      spec[f * nFilters + m] = Math.log(Math.max(energy, 1e-9));
+    }
+  }
+
+  // Transpose to [nFilters × nFrames] (bins × time — what ResNet-18 expects as channels × H × W)
+  // Here we return it as a flat [1 × 1 × nFilters × nFrames] tensor buffer
+  const transposed = new Float32Array(nFilters * nFrames);
+  for (let f = 0; f < nFrames; f++) {
+    for (let m = 0; m < nFilters; m++) {
+      transposed[m * nFrames + f] = spec[f * nFilters + m];
+    }
+  }
+  return { data: transposed, nFilters, nFrames };
+}
+
+// ─── Load ONNX model ──────────────────────────────────────
+async function loadOnnxModel() {
+  if (typeof ort === 'undefined') {
+    console.warn('onnxruntime-web not loaded — falling back to heuristic audio');
+    return false;
+  }
+  try {
+    onnxSession    = await ort.InferenceSession.create(ONNX_MODEL_PATH);
+    onnxReady      = true;
+    onnxRingBuffer = new Float32Array(ONNX_WINDOW_SIZE * 2);
+    onnxWritePtr   = 0;
+    console.log('ResNet laughter model loaded ✓');
+    return true;
+  } catch (e) {
+    console.warn('ONNX model failed to load, falling back to heuristic audio:', e);
+    return false;
+  }
+}
+
+// Run model on the current 1-second ring-buffer window.
+// Returns a probability in [0, 1] for the "laugh" class.
+async function runOnnxInference() {
+  if (!onnxReady || !onnxSession) return null;
+  try {
+    // Extract 1-second window from ring buffer
+    const clip = new Float32Array(ONNX_WINDOW_SIZE);
+    for (let i = 0; i < ONNX_WINDOW_SIZE; i++) {
+      clip[i] = onnxRingBuffer[(onnxWritePtr - ONNX_WINDOW_SIZE + i + onnxRingBuffer.length) % onnxRingBuffer.length];
+    }
+
+    const { data, nFilters, nFrames } = computeLogMelSpectrogram(clip);
+    const tensor = new ort.Tensor('float32', data, [1, 1, nFilters, nFrames]);
+    const output = await onnxSession.run({ input: tensor });
+
+    // Model outputs logits or softmax probabilities for [non-laugh, laugh]
+    const raw = output[Object.keys(output)[0]].data;
+    // Apply softmax if logits (safe either way)
+    const expNL = Math.exp(raw[0]);
+    const expL  = Math.exp(raw[1]);
+    return expL / (expNL + expL);
+  } catch (e) {
+    console.warn('ONNX inference error:', e);
+    return null;
+  }
+}
 
 // ─── Socket handlers ──────────────────────────────────────
 socket.on('room_created', (code) => {
@@ -102,17 +261,16 @@ socket.on('error', (msg) => {
 });
 
 socket.on('game_start', async ({ bestOf: bo, players, maxPlayers: mp, gameMode: gm }) => {
-  bestOf    = bo || 5;
+  bestOf     = bo || 5;
   maxPlayers = mp || 2;
-  gameMode  = gm || 'standard';
+  gameMode   = gm || 'standard';
   playerOrder = players;
 
-  // Elimination setup
-  activePlayers    = [...players];
+  activePlayers     = [...players];
   eliminatedPlayers = [];
   eliminationFinals = false;
 
-  scores = {};
+  scores        = {};
   allTimeScores = {};
   playerOrder.forEach(id => { scores[id] = 0; allTimeScores[id] = 0; });
 
@@ -120,19 +278,16 @@ socket.on('game_start', async ({ bestOf: bo, players, maxPlayers: mp, gameMode: 
   buildCamGrid(playerOrder);
   showScreen('game');
   initFaceDetection();
-  initAudioDetection();
+  await initAudioDetection();
 
   const myIndex = playerOrder.indexOf(me());
-  for (let i = 0; i < myIndex; i++) {
-    await offerTo(playerOrder[i]);
-  }
+  for (let i = 0; i < myIndex; i++) await offerTo(playerOrder[i]);
 
   beginPrepPhase();
 });
 
 socket.on('game_event', async ({ type, data, fromId }) => {
   switch (type) {
-
     case 'offer': {
       const pc = getOrCreatePC(fromId);
       await pc.setRemoteDescription(new RTCSessionDescription(data));
@@ -154,31 +309,22 @@ socket.on('game_event', async ({ type, data, fromId }) => {
       if (pc && data.candidate) pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(() => {});
       break;
     }
-
     case 'i_laughed':
       handlePlayerLaughed(fromId);
       break;
-
     case 'next_round_vote_update': {
       const btn = document.getElementById('next-btn');
-      if (btn && btn.disabled) {
-        btn.textContent = 'waiting (' + data.votes + '/' + data.needed + ')...';
-      }
+      if (btn && btn.disabled) btn.textContent = 'waiting (' + data.votes + '/' + data.needed + ')...';
       break;
     }
-
     case 'begin_round':
       beginPrepPhase();
       break;
-
     case 'rematch_vote': {
       const btn = document.getElementById('next-btn');
-      if (btn && btn.disabled) {
-        btn.textContent = 'waiting (' + data.votes + '/' + data.needed + ')...';
-      }
+      if (btn && btn.disabled) btn.textContent = 'waiting (' + data.votes + '/' + data.needed + ')...';
       break;
     }
-
     case 'rematch_go':
       if (data?.bestOf) bestOf = data.bestOf;
       resetGame();
@@ -190,8 +336,8 @@ socket.on('opponent_left', ({ id }) => {
   const slot = document.getElementById('cam-slot-' + id);
   if (slot) slot.remove();
   if (peers[id]) { peers[id].close(); delete peers[id]; }
-  playerOrder      = playerOrder.filter(p => p !== id);
-  activePlayers    = activePlayers.filter(p => p !== id);
+  playerOrder       = playerOrder.filter(p => p !== id);
+  activePlayers     = activePlayers.filter(p => p !== id);
   eliminatedPlayers = eliminatedPlayers.filter(p => p !== id);
   alert('A player disconnected.');
   goLobby();
@@ -244,13 +390,12 @@ async function startCamera() {
 function buildCamGrid(players) {
   const cams = document.getElementById('cams');
   cams.innerHTML = '';
+  updateCamsClass(cams, activePlayers.length, eliminatedPlayers.length);
 
-  const activeCount = activePlayers.length;
-  updateCamsClass(cams, activeCount, eliminatedPlayers.length);
-
-  players.forEach((id, i) => {
+  players.forEach((id) => {
     const isMe        = id === me();
     const isEliminated = eliminatedPlayers.includes(id);
+
     const wrap = document.createElement('div');
     wrap.className = 'cam-wrap' + (isEliminated ? ' spectator' : '');
     wrap.id = 'cam-slot-' + id;
@@ -294,16 +439,13 @@ function buildCamGrid(players) {
   });
 }
 
-// Set the correct CSS classes on .cams based on current active/spectator counts
 function updateCamsClass(cams, activeCount, spectatorCount) {
-  // Strip all players-N and has-spectators classes
   cams.className = cams.className.replace(/players-\d+/g, '').replace('has-spectators', '').trim();
   cams.classList.add('cams');
   cams.classList.add('players-' + Math.max(activeCount, 1));
   if (spectatorCount > 0) cams.classList.add('has-spectators');
 }
 
-// Called when a player is eliminated in elimination mode
 function eliminatePlayer(id) {
   if (eliminatedPlayers.includes(id)) return;
   eliminatedPlayers.push(id);
@@ -312,137 +454,200 @@ function eliminatePlayer(id) {
   const wrap = document.getElementById('cam-slot-' + id);
   if (wrap) {
     wrap.classList.add('spectator');
-    // Show skull badge
     const outBadge = document.getElementById('out-badge-' + id);
     if (outBadge) outBadge.classList.add('visible');
-    // Mute their audio track in the peer connection
     const vid = document.getElementById('video-' + id);
-    if (vid && vid.srcObject) {
-      vid.srcObject.getAudioTracks().forEach(t => { t.enabled = false; });
-    }
+    if (vid && vid.srcObject) vid.srcObject.getAudioTracks().forEach(t => { t.enabled = false; });
   }
 
-  // Reflow the grid
   const cams = document.getElementById('cams');
   updateCamsClass(cams, activePlayers.length, eliminatedPlayers.length);
 }
 
-// ─── Audio Detection ──────────────────────────────────────
-function initAudioDetection() {
+// ─── Audio Detection (ResNet ONNX + heuristic fallback) ───
+async function initAudioDetection() {
   if (!localStream || audioCtx) return;
+
+  // Try to load the ONNX model first
+  const modelLoaded = await loadOnnxModel();
+
   try {
-    audioCtx = new AudioContext();
+    // Use 8 kHz if ONNX model loaded (matches training), otherwise browser default
+    const ctxOptions = modelLoaded ? { sampleRate: ONNX_SAMPLE_RATE } : {};
+    audioCtx = new AudioContext(ctxOptions);
     if (audioCtx.state === 'suspended') audioCtx.resume();
 
-    const source   = audioCtx.createMediaStreamSource(localStream);
-    const analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 1024;
-    source.connect(analyser);
+    const source = audioCtx.createMediaStreamSource(localStream);
 
-    const bufLen  = analyser.frequencyBinCount;
-    const dataArr = new Uint8Array(bufLen);
-    const binHz   = audioCtx.sampleRate / analyser.fftSize;
+    if (modelLoaded) {
+      // ── ResNet path: ScriptProcessor feeds ring buffer; inference runs on hop ──
+      const bufferSize = 512;
+      scriptProcessor = audioCtx.createScriptProcessor(bufferSize, 1, 1);
+      source.connect(scriptProcessor);
+      scriptProcessor.connect(audioCtx.destination);
 
-    const MEL_BANDS = 12;
-    const melLow    = 300;
-    const melHigh   = 4000;
-    const melMin    = 2595 * Math.log10(1 + melLow  / 700);
-    const melMax    = 2595 * Math.log10(1 + melHigh / 700);
-    const melPoints = [];
-    for (let i = 0; i <= MEL_BANDS + 1; i++) {
-      const m  = melMin + (melMax - melMin) * (i / (MEL_BANDS + 1));
-      const hz = 700 * (Math.pow(10, m / 2595) - 1);
-      melPoints.push(Math.round(hz / binHz));
+      scriptProcessor.onaudioprocess = async (e) => {
+        if (!audioCtx) return;
+        const input = e.inputBuffer.getChannelData(0);
+
+        // Fill ring buffer
+        for (let i = 0; i < input.length; i++) {
+          onnxRingBuffer[onnxWritePtr % onnxRingBuffer.length] = input[i];
+          onnxWritePtr++;
+        }
+        onnxFramesSinceInference += input.length;
+
+        if (onnxFramesSinceInference < ONNX_HOP_SIZE) return;
+        onnxFramesSinceInference = 0;
+
+        // Skip inference if not needed (saves CPU)
+        if (!laughDetectionActive || laughTriggered) {
+          _audioLaughConfidence = 0;
+          return;
+        }
+
+        // Check RMS — skip silent frames to save CPU
+        let rmsSum = 0;
+        const window = new Float32Array(ONNX_WINDOW_SIZE);
+        for (let i = 0; i < ONNX_WINDOW_SIZE; i++) {
+          const s = onnxRingBuffer[(onnxWritePtr - ONNX_WINDOW_SIZE + i + onnxRingBuffer.length) % onnxRingBuffer.length];
+          window[i] = s;
+          rmsSum += s * s;
+        }
+        const rms = Math.sqrt(rmsSum / ONNX_WINDOW_SIZE);
+        if (rms < 0.01) { _audioLaughConfidence = 0; return; }
+
+        const prob = await runOnnxInference();
+        if (prob === null) return;
+        _audioLaughConfidence = prob;
+
+        updateAudioTrigger();
+      };
+
+      console.log('Audio detection: ResNet ONNX mode');
+    } else {
+      // ── Heuristic fallback (original code) ────────────────
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      source.connect(analyser);
+      runHeuristicAudioLoop(analyser);
+      console.log('Audio detection: heuristic fallback mode');
+    }
+  } catch (e) {
+    console.warn('Audio detection unavailable:', e);
+  }
+}
+
+// Called after each ONNX inference (or heuristic frame) to check for laugh trigger
+function updateAudioTrigger() {
+  if (!laughDetectionActive || laughTriggered || faceMesh) return;
+
+  if (_audioLaughConfidence >= AUDIO_SOLO_THRESHOLD) {
+    if (!laughStartTime) laughStartTime = Date.now();
+    else if (Date.now() - laughStartTime > LAUGH_SUSTAIN_MS) triggerLaugh();
+  } else {
+    laughStartTime = null;
+  }
+}
+
+// Original heuristic audio loop (unchanged, used as fallback)
+function runHeuristicAudioLoop(analyser) {
+  const bufLen  = analyser.frequencyBinCount;
+  const dataArr = new Uint8Array(bufLen);
+  const binHz   = audioCtx.sampleRate / analyser.fftSize;
+
+  const MEL_BANDS = 12;
+  const melLow    = 300;
+  const melHigh   = 4000;
+  const melMin    = 2595 * Math.log10(1 + melLow  / 700);
+  const melMax    = 2595 * Math.log10(1 + melHigh / 700);
+  const melPoints = [];
+  for (let i = 0; i <= MEL_BANDS + 1; i++) {
+    const m  = melMin + (melMax - melMin) * (i / (MEL_BANDS + 1));
+    const hz = 700 * (Math.pow(10, m / 2595) - 1);
+    melPoints.push(Math.round(hz / binHz));
+  }
+
+  let prevBands    = new Array(MEL_BANDS).fill(0);
+  let zcBuffer     = [];
+  let energyBuffer = [];
+  let fluxBuffer   = [];
+  const BUF_SIZE   = 20;
+
+  const audioLoop = () => {
+    if (!audioCtx) return;
+    analyser.getByteFrequencyData(dataArr);
+
+    let rmsSum = 0;
+    for (let i = 0; i < bufLen; i++) rmsSum += (dataArr[i] / 255) ** 2;
+    const rms = Math.sqrt(rmsSum / bufLen);
+
+    if (rms < 0.02) {
+      _audioLaughConfidence = 0;
+      prevBands.fill(0);
+      requestAnimationFrame(audioLoop);
+      return;
     }
 
-    let prevBands    = new Array(MEL_BANDS).fill(0);
-    let zcBuffer     = [];
-    let energyBuffer = [];
-    let fluxBuffer   = [];
-    const BUF_SIZE   = 20;
+    const bands = new Array(MEL_BANDS).fill(0);
+    let totalEnergy = 0;
+    for (let b = 0; b < MEL_BANDS; b++) {
+      const lo = melPoints[b], hi = melPoints[b + 2];
+      let sum = 0, cnt = 0;
+      for (let k = lo; k <= Math.min(hi, bufLen - 1); k++) { sum += dataArr[k]; cnt++; }
+      bands[b] = cnt > 0 ? sum / cnt : 0;
+      totalEnergy += bands[b];
+    }
+    if (totalEnergy < 1) { _audioLaughConfidence = 0; requestAnimationFrame(audioLoop); return; }
 
-    const audioLoop = () => {
-      if (!audioCtx) return;
-      analyser.getByteFrequencyData(dataArr);
+    let centNum = 0, centDen = 0;
+    for (let b = 0; b < MEL_BANDS; b++) { centNum += b * bands[b]; centDen += bands[b]; }
+    const centroid = centDen > 0 ? centNum / (centDen * (MEL_BANDS - 1)) : 0;
 
-      let rmsSum = 0;
-      for (let i = 0; i < bufLen; i++) rmsSum += (dataArr[i] / 255) ** 2;
-      const rms = Math.sqrt(rmsSum / bufLen);
+    let cum = 0, rolloff = MEL_BANDS - 1;
+    for (let b = 0; b < MEL_BANDS; b++) {
+      cum += bands[b];
+      if (cum / totalEnergy >= 0.85) { rolloff = b; break; }
+    }
+    const rolloffNorm = rolloff / (MEL_BANDS - 1);
 
-      if (rms < 0.02) {
-        _audioLaughConfidence = 0;
-        prevBands.fill(0);
-        requestAnimationFrame(audioLoop);
-        return;
-      }
+    let flux = 0;
+    for (let b = 0; b < MEL_BANDS; b++) flux += Math.abs(bands[b] - prevBands[b]);
+    flux /= (MEL_BANDS * 255);
+    prevBands = [...bands];
 
-      const bands = new Array(MEL_BANDS).fill(0);
-      let totalEnergy = 0;
-      for (let b = 0; b < MEL_BANDS; b++) {
-        const lo = melPoints[b], hi = melPoints[b + 2];
-        let sum = 0, cnt = 0;
-        for (let k = lo; k <= Math.min(hi, bufLen - 1); k++) { sum += dataArr[k]; cnt++; }
-        bands[b] = cnt > 0 ? sum / cnt : 0;
-        totalEnergy += bands[b];
-      }
-      if (totalEnergy < 1) { _audioLaughConfidence = 0; requestAnimationFrame(audioLoop); return; }
+    let hfSum = 0;
+    for (let b = 8; b < MEL_BANDS; b++) hfSum += bands[b];
+    const zcr = totalEnergy > 0 ? hfSum / totalEnergy : 0;
 
-      let centNum = 0, centDen = 0;
-      for (let b = 0; b < MEL_BANDS; b++) { centNum += b * bands[b]; centDen += bands[b]; }
-      const centroid = centDen > 0 ? centNum / (centDen * (MEL_BANDS - 1)) : 0;
+    const push = (buf, val) => { buf.push(val); if (buf.length > BUF_SIZE) buf.shift(); };
+    push(energyBuffer, rms);
+    push(fluxBuffer,   flux);
+    push(zcBuffer,     zcr);
 
-      let cum = 0, rolloff = MEL_BANDS - 1;
-      for (let b = 0; b < MEL_BANDS; b++) {
-        cum += bands[b];
-        if (cum / totalEnergy >= 0.85) { rolloff = b; break; }
-      }
-      const rolloffNorm = rolloff / (MEL_BANDS - 1);
+    const avgFlux = fluxBuffer.reduce((a, b) => a + b, 0) / fluxBuffer.length;
+    const avgZcr  = zcBuffer.reduce((a, b)  => a + b, 0)  / zcBuffer.length;
 
-      let flux = 0;
-      for (let b = 0; b < MEL_BANDS; b++) flux += Math.abs(bands[b] - prevBands[b]);
-      flux /= (MEL_BANDS * 255);
-      prevBands = [...bands];
+    const centroidScore = (centroid > 0.30 && centroid < 0.80) ? 1 : 0;
+    const rolloffScore  = (rolloffNorm > 0.45 && rolloffNorm < 0.92) ? 1 : 0;
+    const fluxScore     = Math.min(avgFlux / 0.04, 1);
+    const zcrScore      = (avgZcr > 0.15 && avgZcr < 0.65) ? 1 : 0;
+    const energyScore   = Math.min(rms / 0.12, 1);
 
-      let hfSum = 0;
-      for (let b = 8; b < MEL_BANDS; b++) hfSum += bands[b];
-      const zcr = totalEnergy > 0 ? hfSum / totalEnergy : 0;
+    _audioLaughConfidence = Math.min(
+      (centroidScore * 0.20) +
+      (rolloffScore  * 0.20) +
+      (fluxScore     * 0.25) +
+      (zcrScore      * 0.15) +
+      (energyScore   * 0.20),
+      1
+    );
 
-      const push = (buf, val) => { buf.push(val); if (buf.length > BUF_SIZE) buf.shift(); };
-      push(energyBuffer, rms);
-      push(fluxBuffer,   flux);
-      push(zcBuffer,     zcr);
-
-      const avgFlux = fluxBuffer.reduce((a, b) => a + b, 0) / fluxBuffer.length;
-      const avgZcr  = zcBuffer.reduce((a, b) => a + b, 0)   / zcBuffer.length;
-
-      const centroidScore = (centroid > 0.30 && centroid < 0.80) ? 1 : 0;
-      const rolloffScore  = (rolloffNorm > 0.45 && rolloffNorm < 0.92) ? 1 : 0;
-      const fluxScore     = Math.min(avgFlux / 0.04, 1);
-      const zcrScore      = (avgZcr > 0.15 && avgZcr < 0.65) ? 1 : 0;
-      const energyScore   = Math.min(rms / 0.12, 1);
-
-      _audioLaughConfidence = Math.min(
-        (centroidScore * 0.20) +
-        (rolloffScore  * 0.20) +
-        (fluxScore     * 0.25) +
-        (zcrScore      * 0.15) +
-        (energyScore   * 0.20),
-        1
-      );
-
-      if (laughDetectionActive && !laughTriggered && !faceMesh) {
-        if (_audioLaughConfidence >= AUDIO_SOLO_THRESHOLD) {
-          if (!laughStartTime) laughStartTime = Date.now();
-          else if (Date.now() - laughStartTime > LAUGH_SUSTAIN_MS) triggerLaugh();
-        } else {
-          laughStartTime = null;
-        }
-      }
-
-      requestAnimationFrame(audioLoop);
-    };
+    updateAudioTrigger();
     requestAnimationFrame(audioLoop);
-  } catch (e) { console.warn('Audio detection unavailable:', e); }
+  };
+
+  requestAnimationFrame(audioLoop);
 }
 
 // ─── Face Detection ───────────────────────────────────────
@@ -528,14 +733,15 @@ function onFaceResults(results) {
   const cheekDelta = cheek - baselineCheek;
   const cheekScore = Math.min(Math.max(cheekDelta / 0.03, 0), 1);
 
-  const eyeDelta   = baselineEye - eyeApert;
-  const eyeScore   = Math.min(Math.max(eyeDelta / 0.015, 0), 1);
+  const eyeDelta  = baselineEye - eyeApert;
+  const eyeScore  = Math.min(Math.max(eyeDelta / 0.015, 0), 1);
 
-  const faceScore  = Math.min(
+  const faceScore = Math.min(
     (mouthScore * 0.60) + (cheekScore * 0.25) + (eyeScore * 0.15),
     1
   );
 
+  // Blend with audio confidence (ONNX or heuristic — same variable either way)
   const blended = (faceScore * FACE_WEIGHT) + (_audioLaughConfidence * AUDIO_WEIGHT);
   const shouldAccumulate = blended >= COMBINED_TRIGGER_THRESHOLD || faceScore >= FACE_SOLO_THRESHOLD;
 
@@ -569,7 +775,8 @@ function finishCalibration() {
 
   const trimmed = (arr) => {
     const sorted = [...arr].sort((a, b) => a - b);
-    const lo = Math.floor(n * 0.2), hi = Math.ceil(n * 0.8);
+    const lo    = Math.floor(n * 0.2);
+    const hi    = Math.ceil(n * 0.8);
     const slice = sorted.slice(lo, hi);
     return slice.reduce((a, b) => a + b, 0) / slice.length;
   };
@@ -584,7 +791,7 @@ function finishCalibration() {
 
 function triggerLaugh() {
   if (laughTriggered || !roundActive) return;
-  laughTriggered = true;
+  laughTriggered       = true;
   laughDetectionActive = false;
   socket.emit('game_event', { code: roomCode, type: 'i_laughed' });
   handlePlayerLaughed(me());
@@ -603,22 +810,17 @@ function handlePlayerLaughed(id) {
   if (laughedThisRound.has(id)) return;
   laughedThisRound.add(id);
 
-  // Show laugh badge briefly
   const badge = document.getElementById('laugh-badge-' + id);
   if (badge) {
     badge.classList.add('visible');
-    // In elimination mode, swap to skull after 800ms
     if (gameMode === 'elimination' && !eliminationFinals) {
-      setTimeout(() => {
-        badge.classList.remove('visible');
-      }, 800);
+      setTimeout(() => badge.classList.remove('visible'), 800);
     }
   }
 
   if (gameMode === 'elimination' && !eliminationFinals) {
     handleEliminationLaugh(id);
   } else {
-    // Standard mode or elimination finals (2-player)
     const remaining = activePlayers.filter(p => !laughedThisRound.has(p));
     if (activePlayers.length <= 2) {
       endRound();
@@ -629,43 +831,31 @@ function handlePlayerLaughed(id) {
 }
 
 function handleEliminationLaugh(id) {
-  // Immediately eliminate the player — live reflow, no interstitial
   eliminatePlayer(id);
-
   const stillActive = activePlayers.length;
 
   if (stillActive === 1) {
-    // Last one standing — tournament over
-    roundActive = false;
+    roundActive          = false;
     laughDetectionActive = false;
     stopTimer();
     document.getElementById('laugh-btn').disabled = true;
     playerOrder.forEach(pid => { allTimeScores[pid] = (allTimeScores[pid] || 0) + (scores[pid] || 0); });
-    // Brief pause so players see the final elimination before game-over screen
     setTimeout(() => showGameOver(activePlayers[0]), 1200);
     return;
   }
 
   if (stillActive === 2) {
-    // Transition to finals — keep the round running but switch mode
     eliminationFinals = true;
     activePlayers.forEach(pid => { scores[pid] = 0; });
     updateScoreHUD();
-
-    // Show a non-blocking "FINALS" flash overlay, then continue
-    showFinalsFlash(() => {
-      // Round is still live — both finalists keep playing
-      // (their detection/timers never stopped)
-    });
+    showFinalsFlash(() => {});
     return;
   }
-
-  // 3+ still active: round continues, no interruption at all
 }
 
 function endRound() {
   if (!roundActive) return;
-  roundActive = false;
+  roundActive          = false;
   laughDetectionActive = false;
   stopTimer();
   document.getElementById('laugh-btn').disabled = true;
@@ -687,7 +877,6 @@ function endRound() {
   }
 }
 
-// Non-blocking "FINALS" flash — big text animates over the game screen then disappears
 function showFinalsFlash(onDone) {
   const existing = document.getElementById('finals-flash');
   if (existing) existing.remove();
@@ -704,7 +893,6 @@ function showFinalsFlash(onDone) {
   `;
   document.body.appendChild(flash);
 
-  // Auto-remove after animation
   setTimeout(() => {
     flash.classList.add('finals-flash-out');
     setTimeout(() => { flash.remove(); onDone && onDone(); }, 500);
@@ -713,16 +901,14 @@ function showFinalsFlash(onDone) {
 
 // ─── Result screens ───────────────────────────────────────
 function showRoundResult(winnerId) {
-  const iWon      = winnerId === me();
-  const noWinner  = winnerId === null;
+  const iWon     = winnerId === me();
+  const noWinner = winnerId === null;
   const iAmActive = activePlayers.includes(me());
 
   document.getElementById('round-emoji').textContent = noWinner ? '🤝' : iWon ? '🏆' : (iAmActive ? '😅' : '💀');
-  document.getElementById('round-title').textContent = noWinner ? 'everyone laughed'
-    : iWon ? 'you held it!'
-    : 'you laughed';
-  document.getElementById('round-title').className = 'result-title ' + (iWon ? 'win' : noWinner ? '' : 'lose');
-  document.getElementById('round-sub').textContent = noWinner ? 'no points awarded'
+  document.getElementById('round-title').textContent = noWinner ? 'everyone laughed' : iWon ? 'you held it!' : 'you laughed';
+  document.getElementById('round-title').className   = 'result-title ' + (iWon ? 'win' : noWinner ? '' : 'lose');
+  document.getElementById('round-sub').textContent   = noWinner ? 'no points awarded'
     : iWon ? 'you win the round'
     : winnerId ? 'player ' + (playerOrder.indexOf(winnerId) + 1) + ' wins the round' : '';
 
@@ -756,7 +942,7 @@ function showGameOver(winnerId) {
   showScreen('over');
 }
 
-// ─── Next round — server-authoritative voting ─────────────
+// ─── Next round / rematch ─────────────────────────────────
 function requestNextRound() {
   const btn       = document.getElementById('next-btn');
   btn.disabled    = true;
@@ -772,8 +958,7 @@ function requestRematch() {
 }
 
 async function resetGame() {
-  // Full reset — everyone re-enters active grid
-  activePlayers    = [...playerOrder];
+  activePlayers     = [...playerOrder];
   eliminatedPlayers = [];
   eliminationFinals = false;
 
@@ -798,15 +983,14 @@ async function resetGame() {
 // ─── Game flow ────────────────────────────────────────────
 function beginPrepPhase() {
   showScreen('game');
-  roundActive          = false;
-  laughDetectionActive = false;
-  laughTriggered       = false;
-  laughStartTime       = null;
+  roundActive           = false;
+  laughDetectionActive  = false;
+  laughTriggered        = false;
+  laughStartTime        = null;
   _audioLaughConfidence = 0;
   laughedThisRound.clear();
   document.getElementById('laugh-btn').disabled = true;
 
-  // Clear laugh badges (keep out-badges for eliminated players)
   playerOrder.forEach(id => {
     const badge = document.getElementById('laugh-badge-' + id);
     if (badge) badge.classList.remove('visible');
@@ -817,9 +1001,7 @@ function beginPrepPhase() {
   updateTimerDisplay();
   setStatus('', false);
 
-  // Only active players are in the round — re-check if I'm still active
   const iAmActive = activePlayers.includes(me());
-
   if (faceMesh && iAmActive) {
     calibrating        = true;
     calibrationSamples = [];
@@ -842,10 +1024,12 @@ function beginPrepPhase() {
 function runCountdown(steps, onDone) {
   const existing = document.getElementById('countdown-overlay');
   if (existing) existing.remove();
+
   const overlay = document.createElement('div');
   overlay.className = 'countdown-overlay';
   overlay.id = 'countdown-overlay';
   document.body.appendChild(overlay);
+
   let i = 0;
   const showNext = () => {
     if (i >= steps.length) { overlay.remove(); onDone(); return; }
@@ -862,16 +1046,11 @@ function runCountdown(steps, onDone) {
 
 function goRound() {
   const iAmActive = activePlayers.includes(me());
-
-  if (iAmActive) {
-    setStatus("😐  don't laugh.", true);
-  } else {
-    setStatus('👀  watching...', false);
-  }
+  setStatus(iAmActive ? "😐  don't laugh." : '👀  watching...', iAmActive);
 
   roundActive          = true;
-  laughDetectionActive = iAmActive;   // spectators don't trigger detection
-  laughTriggered       = !iAmActive;  // treat spectators as already "done"
+  laughDetectionActive = iAmActive;
+  laughTriggered       = !iAmActive;
   laughStartTime       = null;
   calibrating          = false;
 
@@ -926,7 +1105,6 @@ function setMaxPlayers(n) {
     const btn = document.getElementById('mp-' + v);
     if (btn) btn.className = 'btn' + (v === n ? ' primary' : '');
   });
-  // Show/hide game mode selector — elimination only makes sense for 3+
   const modeRow = document.getElementById('mode-row');
   if (modeRow) modeRow.style.display = n >= 3 ? '' : 'none';
   if (n < 3) setGameMode('standard');
@@ -941,7 +1119,7 @@ function setGameMode(mode) {
   const desc = document.getElementById('mode-desc');
   if (desc) {
     desc.textContent = mode === 'elimination'
-      ? 'laugh = you\'re out · last one standing wins'
+      ? "laugh = you're out · last one standing wins"
       : 'first to laugh loses the round · best of ' + selectedBestOf;
   }
 }
@@ -995,11 +1173,18 @@ function cleanup() {
   laughDetectionActive  = false;
   calibrating           = false;
   _audioLaughConfidence = 0;
+  onnxFramesSinceInference = 0;
+
+  if (scriptProcessor) {
+    try { scriptProcessor.disconnect(); } catch (_) {}
+    scriptProcessor = null;
+  }
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   for (const id in peers) { peers[id].close(); }
-  peers             = {};
+  peers = {};
   if (faceMesh) { faceMesh.close(); faceMesh = null; }
+
   roomCode          = null;
   playerOrder       = [];
   activePlayers     = [];
@@ -1012,6 +1197,7 @@ function cleanup() {
   document.getElementById('timer').classList.remove('danger');
 }
 
+// ─── Keyboard shortcut ────────────────────────────────────
 document.addEventListener('keydown', e => {
   if (e.code === 'Space' && document.getElementById('screen-game').classList.contains('active')) {
     e.preventDefault();
