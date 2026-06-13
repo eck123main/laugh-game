@@ -603,48 +603,64 @@ function handlePlayerLaughed(id) {
   if (laughedThisRound.has(id)) return;
   laughedThisRound.add(id);
 
+  // Show laugh badge briefly
   const badge = document.getElementById('laugh-badge-' + id);
-  if (badge) badge.classList.add('visible');
+  if (badge) {
+    badge.classList.add('visible');
+    // In elimination mode, swap to skull after 800ms
+    if (gameMode === 'elimination' && !eliminationFinals) {
+      setTimeout(() => {
+        badge.classList.remove('visible');
+      }, 800);
+    }
+  }
 
   if (gameMode === 'elimination' && !eliminationFinals) {
     handleEliminationLaugh(id);
   } else {
-    // Standard mode (or elimination finals with 2 players)
+    // Standard mode or elimination finals (2-player)
     const remaining = activePlayers.filter(p => !laughedThisRound.has(p));
-    if (activePlayers.length === 2) {
-      // 1v1: first laugh ends the round
+    if (activePlayers.length <= 2) {
       endRound();
     } else {
-      // Multi-player standard: all but one laughed
       if (remaining.length <= 1) endRound();
     }
   }
 }
 
 function handleEliminationLaugh(id) {
-  // In elimination mode: the player who laughed is out of the tournament
-  // (unless we've already reached finals with 2 players)
+  // Immediately eliminate the player — live reflow, no interstitial
   eliminatePlayer(id);
 
   const stillActive = activePlayers.length;
 
   if (stillActive === 1) {
-    // Tournament winner!
-    endEliminationTournament(activePlayers[0]);
+    // Last one standing — tournament over
+    roundActive = false;
+    laughDetectionActive = false;
+    stopTimer();
+    document.getElementById('laugh-btn').disabled = true;
+    playerOrder.forEach(pid => { allTimeScores[pid] = (allTimeScores[pid] || 0) + (scores[pid] || 0); });
+    // Brief pause so players see the final elimination before game-over screen
+    setTimeout(() => showGameOver(activePlayers[0]), 1200);
     return;
   }
 
   if (stillActive === 2) {
-    // Transition to finals — switch to standard best-of mode
+    // Transition to finals — keep the round running but switch mode
     eliminationFinals = true;
-    // Reset scores for the 2 finalists
     activePlayers.forEach(pid => { scores[pid] = 0; });
-    endRoundElimination('finals_transition');
+    updateScoreHUD();
+
+    // Show a non-blocking "FINALS" flash overlay, then continue
+    showFinalsFlash(() => {
+      // Round is still live — both finalists keep playing
+      // (their detection/timers never stopped)
+    });
     return;
   }
 
-  // Still 3+ active: end this round (no winner scored) and start a new round
-  endRoundElimination('continue');
+  // 3+ still active: round continues, no interruption at all
 }
 
 function endRound() {
@@ -655,10 +671,7 @@ function endRound() {
   document.getElementById('laugh-btn').disabled = true;
 
   const remaining = activePlayers.filter(p => !laughedThisRound.has(p));
-  const winnerId  = remaining.length === 1 ? remaining[0]
-                  : (activePlayers.length === 2 && laughedThisRound.size >= 1)
-                    ? remaining[0] || null
-                    : null;
+  const winnerId  = remaining.length >= 1 ? remaining[0] : null;
 
   if (winnerId) scores[winnerId] = (scores[winnerId] || 0) + 1;
   updateScoreHUD();
@@ -674,43 +687,39 @@ function endRound() {
   }
 }
 
-// Elimination mode: end of an elimination sub-round (no score awarded, just reflow)
-function endRoundElimination(reason) {
-  if (!roundActive) return;
-  roundActive = false;
-  laughDetectionActive = false;
-  stopTimer();
-  document.getElementById('laugh-btn').disabled = true;
+// Non-blocking "FINALS" flash — big text animates over the game screen then disappears
+function showFinalsFlash(onDone) {
+  const existing = document.getElementById('finals-flash');
+  if (existing) existing.remove();
 
-  if (reason === 'finals_transition') {
-    showEliminationFinalsTransition();
-  } else {
-    // Show who was eliminated then continue
-    showEliminationRoundResult();
-  }
-}
+  const flash = document.createElement('div');
+  flash.id = 'finals-flash';
+  flash.innerHTML = `
+    <div class="finals-flash-inner">
+      <div class="finals-flash-label">finals</div>
+      <div class="finals-flash-sub">${
+        activePlayers.map(pid => 'player ' + (playerOrder.indexOf(pid) + 1)).join(' vs ')
+      }</div>
+    </div>
+  `;
+  document.body.appendChild(flash);
 
-function endEliminationTournament(winnerId) {
-  if (!roundActive) return;
-  roundActive = false;
-  laughDetectionActive = false;
-  stopTimer();
-  document.getElementById('laugh-btn').disabled = true;
-
-  playerOrder.forEach(id => { allTimeScores[id] = (allTimeScores[id] || 0) + (scores[id] || 0); });
-  showGameOver(winnerId);
+  // Auto-remove after animation
+  setTimeout(() => {
+    flash.classList.add('finals-flash-out');
+    setTimeout(() => { flash.remove(); onDone && onDone(); }, 500);
+  }, 2000);
 }
 
 // ─── Result screens ───────────────────────────────────────
 function showRoundResult(winnerId) {
-  const iWon     = winnerId === me();
-  const noWinner = winnerId === null;
+  const iWon      = winnerId === me();
+  const noWinner  = winnerId === null;
   const iAmActive = activePlayers.includes(me());
 
   document.getElementById('round-emoji').textContent = noWinner ? '🤝' : iWon ? '🏆' : (iAmActive ? '😅' : '💀');
   document.getElementById('round-title').textContent = noWinner ? 'everyone laughed'
     : iWon ? 'you held it!'
-    : iAmActive ? 'you laughed'
     : 'you laughed';
   document.getElementById('round-title').className = 'result-title ' + (iWon ? 'win' : noWinner ? '' : 'lose');
   document.getElementById('round-sub').textContent = noWinner ? 'no points awarded'
@@ -723,52 +732,7 @@ function showRoundResult(winnerId) {
 
   const btn = document.getElementById('next-btn');
   btn.disabled    = false;
-  btn.textContent = activePlayers.includes(me()) ? 'ready for next round →' : 'watching... →';
-  btn.onclick     = requestNextRound;
-  showScreen('round');
-}
-
-function showEliminationRoundResult() {
-  const justEliminated = eliminatedPlayers[eliminatedPlayers.length - 1];
-  const iWasEliminated = justEliminated === me();
-  const iAmStillIn     = activePlayers.includes(me());
-
-  document.getElementById('round-emoji').textContent = iWasEliminated ? '💀' : iAmStillIn ? '😤' : '👀';
-  document.getElementById('round-title').textContent = iWasEliminated ? 'you laughed!' : 'player out!';
-  document.getElementById('round-title').className   = 'result-title ' + (iWasEliminated ? 'lose' : 'win');
-
-  const elimName = 'player ' + (playerOrder.indexOf(justEliminated) + 1);
-  document.getElementById('round-sub').textContent = iWasEliminated
-    ? 'you\'ve been eliminated — watch the rest'
-    : elimName + ' has been eliminated · ' + activePlayers.length + ' remain';
-
-  document.getElementById('rs-you').textContent  = scores[me()] || 0;
-  const others = activePlayers.filter(id => id !== me());
-  document.getElementById('rs-them').textContent = others.map(id => scores[id] || 0).join(' / ') || '—';
-
-  const btn = document.getElementById('next-btn');
-  btn.disabled    = false;
-  btn.textContent = 'continue →';
-  btn.onclick     = requestNextRound;
-  showScreen('round');
-}
-
-function showEliminationFinalsTransition() {
-  const iAmFinalist = activePlayers.includes(me());
-  const f1 = 'player ' + (playerOrder.indexOf(activePlayers[0]) + 1);
-  const f2 = 'player ' + (playerOrder.indexOf(activePlayers[1]) + 1);
-
-  document.getElementById('round-emoji').textContent = iAmFinalist ? '🥊' : '🍿';
-  document.getElementById('round-title').textContent = iAmFinalist ? 'finals!' : 'finals time!';
-  document.getElementById('round-title').className   = 'result-title win';
-  document.getElementById('round-sub').textContent   = f1 + ' vs ' + f2 + ' · best of ' + bestOf;
-
-  document.getElementById('rs-you').textContent  = 0;
-  document.getElementById('rs-them').textContent = 0;
-
-  const btn = document.getElementById('next-btn');
-  btn.disabled    = false;
-  btn.textContent = iAmFinalist ? 'let\'s go →' : 'watch the finals →';
+  btn.textContent = iAmActive ? 'ready for next round →' : 'watching... →';
   btn.onclick     = requestNextRound;
   showScreen('round');
 }
