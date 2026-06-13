@@ -483,42 +483,48 @@ async function initAudioDetection() {
       scriptProcessor.connect(audioCtx.destination);
 
       scriptProcessor.onaudioprocess = async (e) => {
-        if (!audioCtx) return;
-        const input = e.inputBuffer.getChannelData(0);
+  if (!audioCtx) return;
+  const input = e.inputBuffer.getChannelData(0);
+  const nativeSR = audioCtx.sampleRate;
+  
+  // Downsample to 8kHz if needed
+  if (nativeSR !== ONNX_SAMPLE_RATE) {
+    const ratio = nativeSR / ONNX_SAMPLE_RATE;
+    for (let i = 0; i < input.length; i += ratio) {
+      const idx = Math.floor(i);
+      onnxRingBuffer[onnxWritePtr % onnxRingBuffer.length] = input[idx];
+      onnxWritePtr++;
+      onnxFramesSinceInference++;
+    }
+  } else {
+    for (let i = 0; i < input.length; i++) {
+      onnxRingBuffer[onnxWritePtr % onnxRingBuffer.length] = input[i];
+      onnxWritePtr++;
+    }
+    onnxFramesSinceInference += input.length;
+  }
 
-        // Fill ring buffer
-        for (let i = 0; i < input.length; i++) {
-          onnxRingBuffer[onnxWritePtr % onnxRingBuffer.length] = input[i];
-          onnxWritePtr++;
-        }
-        onnxFramesSinceInference += input.length;
+  if (onnxFramesSinceInference < ONNX_HOP_SIZE) return;
+  onnxFramesSinceInference = 0;
 
-        if (onnxFramesSinceInference < ONNX_HOP_SIZE) return;
-        onnxFramesSinceInference = 0;
+  if (!laughDetectionActive || laughTriggered) {
+    _audioLaughConfidence = 0;
+    return;
+  }
 
-        // Skip inference if not needed (saves CPU)
-        if (!laughDetectionActive || laughTriggered) {
-          _audioLaughConfidence = 0;
-          return;
-        }
+  let rmsSum = 0;
+  for (let i = 0; i < ONNX_WINDOW_SIZE; i++) {
+    const s = onnxRingBuffer[(onnxWritePtr - ONNX_WINDOW_SIZE + i + onnxRingBuffer.length) % onnxRingBuffer.length];
+    rmsSum += s * s;
+  }
+  const rms = Math.sqrt(rmsSum / ONNX_WINDOW_SIZE);
+  if (rms < 0.01) { _audioLaughConfidence = 0; return; }
 
-        // Check RMS — skip silent frames to save CPU
-        let rmsSum = 0;
-        const window = new Float32Array(ONNX_WINDOW_SIZE);
-        for (let i = 0; i < ONNX_WINDOW_SIZE; i++) {
-          const s = onnxRingBuffer[(onnxWritePtr - ONNX_WINDOW_SIZE + i + onnxRingBuffer.length) % onnxRingBuffer.length];
-          window[i] = s;
-          rmsSum += s * s;
-        }
-        const rms = Math.sqrt(rmsSum / ONNX_WINDOW_SIZE);
-        if (rms < 0.01) { _audioLaughConfidence = 0; return; }
-
-        const prob = await runOnnxInference();
-        if (prob === null) return;
-        _audioLaughConfidence = prob;
-
-        updateAudioTrigger();
-      };
+  const prob = await runOnnxInference();
+  if (prob === null) return;
+  _audioLaughConfidence = prob;
+  updateAudioTrigger();
+};
 
       console.log('Audio detection: ResNet ONNX mode');
     } else {
@@ -726,10 +732,12 @@ function onFaceResults(results) {
   const mouthDelta = mouth - baselineMouth;
   const mouthScore = Math.min(Math.max(mouthDelta / 0.22, 0), 1);
   const cheekDelta = cheek - baselineCheek;
-  const cheekScore = Math.min(Math.max(cheekDelta / 0.03, 0), 1);
+  const cheekScore = Math.min(Math.max(cheekDelta / 0.10, 0), 1);
+
   const eyeDelta   = baselineEye - eyeApert;
   const eyeScore   = Math.min(Math.max(eyeDelta / 0.015, 0), 1);
-  const faceScore  = Math.min((mouthScore * 0.60) + (cheekScore * 0.25) + (eyeScore * 0.15), 1);
+  const faceScore = Math.min((mouthScore * 0.80) + (cheekScore * 0.10) + (eyeScore * 0.10), 1);
+
   const blended    = (faceScore * FACE_WEIGHT) + (_audioLaughConfidence * AUDIO_WEIGHT);
 
   // ── ADD THIS ──
