@@ -22,18 +22,21 @@ const RTC_CONFIG = {
   ]
 };
 
-const LAUGH_SUSTAIN_MS = 1000;
-const CALIBRATION_FRAMES = 80;
-const LAUGH_THRESHOLD_OPEN_RATIO    = 0.22;
-const LAUGH_THRESHOLD_AUDIO_CONFIRM = 0.6;
-const LAUGH_THRESHOLD_AUDIO_ASSIST  = 0.35;
+// ─── Detection thresholds ─────────────────────────────────
+const LAUGH_SUSTAIN_MS            = 850;   // ms face+audio must agree before trigger
+const CALIBRATION_FRAMES          = 90;    // frames to collect during prep phase
+const FACE_WEIGHT                 = 0.55;  // face vs audio blend
+const AUDIO_WEIGHT                = 0.45;
+const COMBINED_TRIGGER_THRESHOLD  = 0.62;  // blended score needed to start sustain timer
+const FACE_SOLO_THRESHOLD         = 0.80;  // face alone can trigger if very strong
+const AUDIO_SOLO_THRESHOLD        = 0.85;  // audio alone can trigger if extremely strong
 
 // ─── State ────────────────────────────────────────────────
 let localStream;
 let roomCode = null;
 
 const socket = io();
-const me = () => socket.id;   // always live, never stale
+const me = () => socket.id;
 
 let peers = {};
 let playerOrder = [];
@@ -56,11 +59,19 @@ let faceMesh = null;
 let laughDetectionActive = false;
 let laughStartTime = null;
 let laughTriggered = false;
-let baselineMouthRatio = 0.025;
-let calibrating = false;
-let calibrationSamples = [];
+
+// Calibration baselines — mouth, cheek raise delta, eye squint delta
+let baselineMouth  = 0.025;
+let baselineCheek  = 0;
+let baselineEye    = 0;
+let calibrating    = false;
+let calibrationSamples = [];   // [{mouth, cheek, eye}]
+
 let detectionCanvas, detectionCtx;
 let detectionRunning = false;
+
+// Shared audio confidence (written by audio loop, read by face loop)
+let _audioLaughConfidence = 0;
 
 // ─── Socket handlers ──────────────────────────────────────
 socket.on('room_created', (code) => {
@@ -99,8 +110,6 @@ socket.on('game_start', async ({ bestOf: bo, players, maxPlayers: mp }) => {
   initFaceDetection();
   initAudioDetection();
 
-  // WebRTC mesh: player at index I offers to all players at index < I.
-  // Exactly one offerer per pair, no races.
   const myIndex = playerOrder.indexOf(me());
   for (let i = 0; i < myIndex; i++) {
     await offerTo(playerOrder[i]);
@@ -112,7 +121,6 @@ socket.on('game_start', async ({ bestOf: bo, players, maxPlayers: mp }) => {
 socket.on('game_event', async ({ type, data, fromId }) => {
   switch (type) {
 
-    // ── WebRTC signalling ──
     case 'offer': {
       const pc = getOrCreatePC(fromId);
       await pc.setRemoteDescription(new RTCSessionDescription(data));
@@ -135,12 +143,10 @@ socket.on('game_event', async ({ type, data, fromId }) => {
       break;
     }
 
-    // ── Game events ──
     case 'i_laughed':
       handlePlayerLaughed(fromId);
       break;
 
-    // Server tells us how many have voted so far — update button label
     case 'next_round_vote_update': {
       const btn = document.getElementById('next-btn');
       if (btn && btn.disabled) {
@@ -149,12 +155,10 @@ socket.on('game_event', async ({ type, data, fromId }) => {
       break;
     }
 
-    // Server says everyone is ready — all clients begin the round together
     case 'begin_round':
       beginPrepPhase();
       break;
 
-    // Server tells us rematch vote progress
     case 'rematch_vote': {
       const btn = document.getElementById('next-btn');
       if (btn && btn.disabled) {
@@ -182,12 +186,9 @@ socket.on('opponent_left', ({ id }) => {
 // ─── WebRTC helpers ───────────────────────────────────────
 function getOrCreatePC(peerId) {
   if (peers[peerId]) return peers[peerId];
-
   const pc = new RTCPeerConnection(RTC_CONFIG);
   peers[peerId] = pc;
-
   if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-
   pc.ontrack = (e) => {
     const vid = document.getElementById('video-' + peerId);
     if (vid) {
@@ -196,14 +197,12 @@ function getOrCreatePC(peerId) {
       vid.play().catch(() => {});
     }
   };
-
   pc.onicecandidate = (e) => {
     socket.emit('game_event', {
       code: roomCode, type: 'ice',
       data: { candidate: e.candidate, targetId: peerId }
     });
   };
-
   return pc;
 }
 
@@ -235,7 +234,6 @@ function buildCamGrid(players) {
 
   players.forEach((id, i) => {
     const isMe = id === me();
-
     const wrap = document.createElement('div');
     wrap.className = 'cam-wrap';
     wrap.id = 'cam-slot-' + id;
@@ -269,63 +267,188 @@ function buildCamGrid(players) {
   });
 }
 
-// ─── Audio Detection ──────────────────────────────────────
+// ─── Audio Detection (improved) ───────────────────────────
+// Uses mel-filterbank approximation with spectral centroid, rolloff,
+// flux, and ZCR — much more discriminative than raw band energy.
 function initAudioDetection() {
   if (!localStream || audioCtx) return;
   try {
     audioCtx = new AudioContext();
     if (audioCtx.state === 'suspended') audioCtx.resume();
-    const source = audioCtx.createMediaStreamSource(localStream);
+
+    const source   = audioCtx.createMediaStreamSource(localStream);
     const analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 512;
+    analyser.fftSize = 1024;
     source.connect(analyser);
 
-    const dataArray = new Uint8Array(analyser.frequencyBinCount);
-    const binHz = audioCtx.sampleRate / analyser.fftSize;
-    const laughLow  = Math.floor(300  / binHz);
-    const laughHigh = Math.ceil(3000  / binHz);
-    const pulseHistory = [];
-    let lastEnergyState = false;
-    let audioLaughConfidence = 0;
-    window._getAudioConfidence = () => audioLaughConfidence;
+    const bufLen  = analyser.frequencyBinCount;  // 512
+    const dataArr = new Uint8Array(bufLen);
+    const binHz   = audioCtx.sampleRate / analyser.fftSize;
+
+    // Mel-spaced filterbank: 12 bands, 300–4000 Hz
+    const MEL_BANDS = 12;
+    const melLow    = 300;
+    const melHigh   = 4000;
+    const melMin    = 2595 * Math.log10(1 + melLow  / 700);
+    const melMax    = 2595 * Math.log10(1 + melHigh / 700);
+    const melPoints = [];
+    for (let i = 0; i <= MEL_BANDS + 1; i++) {
+      const m  = melMin + (melMax - melMin) * (i / (MEL_BANDS + 1));
+      const hz = 700 * (Math.pow(10, m / 2595) - 1);
+      melPoints.push(Math.round(hz / binHz));
+    }
+
+    let prevBands    = new Array(MEL_BANDS).fill(0);
+    let prevFlux     = 0;
+    let zcBuffer     = [];   // recent zero-crossing rates
+    let energyBuffer = [];   // recent RMS energy values
+    let fluxBuffer   = [];
+    const BUF_SIZE   = 20;
 
     const audioLoop = () => {
       if (!audioCtx) return;
-      analyser.getByteFrequencyData(dataArray);
-      const totalAvg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-      if (totalAvg < 20) { audioLaughConfidence = 0; lastEnergyState = false; requestAnimationFrame(audioLoop); return; }
+      analyser.getByteFrequencyData(dataArr);
 
-      let bandSum = 0;
-      for (let i = laughLow; i <= laughHigh; i++) bandSum += dataArray[i];
-      const bandAvg   = bandSum / (laughHigh - laughLow + 1);
-      const bandRatio = bandAvg / (totalAvg + 1);
-      const now = Date.now();
-      const isHigh = bandAvg > 45;
-      if (isHigh && !lastEnergyState) pulseHistory.push(now);
-      lastEnergyState = isHigh;
-      const cutoff = now - 500;
-      while (pulseHistory.length && pulseHistory[0] < cutoff) pulseHistory.shift();
-      const pulseCount = pulseHistory.length;
-      const spectralOk = bandRatio > 0.5;
-      const rhythmOk   = pulseCount >= 2 && pulseCount <= 8;
-      audioLaughConfidence = (spectralOk ? 0.5 : 0) + (rhythmOk ? 0.5 : 0);
+      // Overall RMS energy
+      let rmsSum = 0;
+      for (let i = 0; i < bufLen; i++) rmsSum += (dataArr[i] / 255) ** 2;
+      const rms = Math.sqrt(rmsSum / bufLen);
 
-      if (laughDetectionActive && !laughTriggered && !faceMesh) {
-        if (audioLaughConfidence >= LAUGH_THRESHOLD_AUDIO_CONFIRM) {
-          if (!laughStartTime) laughStartTime = now;
-          else if (now - laughStartTime > LAUGH_SUSTAIN_MS) triggerLaugh();
-        } else { laughStartTime = null; }
+      // Silence gate
+      if (rms < 0.02) {
+        _audioLaughConfidence = 0;
+        prevBands.fill(0);
+        requestAnimationFrame(audioLoop);
+        return;
       }
+
+      // Mel filterbank energies
+      const bands = new Array(MEL_BANDS).fill(0);
+      let totalEnergy = 0;
+      for (let b = 0; b < MEL_BANDS; b++) {
+        const lo = melPoints[b], hi = melPoints[b + 2];
+        let sum = 0, cnt = 0;
+        for (let k = lo; k <= Math.min(hi, bufLen - 1); k++) {
+          sum += dataArr[k];
+          cnt++;
+        }
+        bands[b] = cnt > 0 ? sum / cnt : 0;
+        totalEnergy += bands[b];
+      }
+      if (totalEnergy < 1) { _audioLaughConfidence = 0; requestAnimationFrame(audioLoop); return; }
+
+      // Spectral centroid (normalised to 0–1 over mel range)
+      let centNum = 0, centDen = 0;
+      for (let b = 0; b < MEL_BANDS; b++) { centNum += b * bands[b]; centDen += bands[b]; }
+      const centroid = centDen > 0 ? centNum / (centDen * (MEL_BANDS - 1)) : 0;
+
+      // Spectral rolloff: band index where cumulative energy hits 85%
+      let cum = 0, rolloff = MEL_BANDS - 1;
+      for (let b = 0; b < MEL_BANDS; b++) {
+        cum += bands[b];
+        if (cum / totalEnergy >= 0.85) { rolloff = b; break; }
+      }
+      const rolloffNorm = rolloff / (MEL_BANDS - 1);
+
+      // Spectral flux (frame-to-frame change)
+      let flux = 0;
+      for (let b = 0; b < MEL_BANDS; b++) flux += Math.abs(bands[b] - prevBands[b]);
+      flux /= (MEL_BANDS * 255);
+      prevBands = [...bands];
+
+      // Zero-crossing rate proxy: high-freq band ratio (bands 8–11 vs all)
+      let hfSum = 0;
+      for (let b = 8; b < MEL_BANDS; b++) hfSum += bands[b];
+      const zcr = totalEnergy > 0 ? hfSum / totalEnergy : 0;
+
+      // Rolling buffers
+      const push = (buf, val) => { buf.push(val); if (buf.length > BUF_SIZE) buf.shift(); };
+      push(energyBuffer, rms);
+      push(fluxBuffer,   flux);
+      push(zcBuffer,     zcr);
+
+      const avgFlux  = fluxBuffer.reduce((a, b) => a + b, 0) / fluxBuffer.length;
+      const avgZcr   = zcBuffer.reduce((a, b) => a + b, 0) / zcBuffer.length;
+
+      // Laugh audio signature:
+      // - centroid 0.35–0.75  (voiced mid-freq, not low rumble or hiss)
+      // - rolloff   0.5–0.9   (energy spread across mid–high bands)
+      // - flux > 0.015        (irregular, rhythmic bursts — not sustained tone)
+      // - zcr 0.2–0.6         (voiced but not pure noise)
+      const centroidScore = (centroid > 0.30 && centroid < 0.80) ? 1 : 0;
+      const rolloffScore  = (rolloffNorm > 0.45 && rolloffNorm < 0.92) ? 1 : 0;
+      const fluxScore     = Math.min(avgFlux / 0.04, 1);          // 0–1
+      const zcrScore      = (avgZcr > 0.15 && avgZcr < 0.65) ? 1 : 0;
+      const energyScore   = Math.min(rms / 0.12, 1);              // 0–1, rewards louder
+
+      // Weighted combination — flux and energy are continuous, rest are binary gates
+      _audioLaughConfidence = Math.min(
+        (centroidScore * 0.20) +
+        (rolloffScore  * 0.20) +
+        (fluxScore     * 0.25) +
+        (zcrScore      * 0.15) +
+        (energyScore   * 0.20),
+        1
+      );
+
+      // Audio-solo mode (no FaceMesh): trigger if extremely confident
+      if (laughDetectionActive && !laughTriggered && !faceMesh) {
+        if (_audioLaughConfidence >= AUDIO_SOLO_THRESHOLD) {
+          if (!laughStartTime) laughStartTime = Date.now();
+          else if (Date.now() - laughStartTime > LAUGH_SUSTAIN_MS) triggerLaugh();
+        } else {
+          laughStartTime = null;
+        }
+      }
+
       requestAnimationFrame(audioLoop);
     };
     requestAnimationFrame(audioLoop);
   } catch (e) { console.warn('Audio detection unavailable:', e); }
 }
 
-// ─── Face Detection ───────────────────────────────────────
+// ─── Face Detection (improved) ────────────────────────────
+// Tracks mouth open ratio, cheek raise, and eye squint.
+// All three signals are calibrated individually during prep phase.
+
+// Landmark indices (MediaPipe Face Mesh)
+const LM_UPPER_LIP    = 13;
+const LM_LOWER_LIP    = 14;
+const LM_LEFT_CORNER  = 78;
+const LM_RIGHT_CORNER = 308;
+const LM_LEFT_CHEEK   = 50;   // left cheek apex
+const LM_RIGHT_CHEEK  = 280;  // right cheek apex
+const LM_LEFT_EYE_TOP = 159;  // left upper eyelid
+const LM_LEFT_EYE_BOT = 145;  // left lower eyelid
+const LM_RIGHT_EYE_TOP= 386;
+const LM_RIGHT_EYE_BOT= 374;
+// Nose tip as a stable vertical reference
+const LM_NOSE_TIP     = 1;
+
+function getFaceFeatures(lm) {
+  // Mouth openness (height / width ratio)
+  const mouthH = Math.abs(lm[LM_LOWER_LIP].y - lm[LM_UPPER_LIP].y);
+  const mouthW = Math.abs(lm[LM_RIGHT_CORNER].x - lm[LM_LEFT_CORNER].x);
+  const mouth  = mouthW > 0.001 ? mouthH / mouthW : 0;
+
+  // Cheek raise: how far cheek apexes are above mouth corners.
+  // Laughter pulls cheeks up, reducing this delta.
+  const cornerMidY = (lm[LM_LEFT_CORNER].y + lm[LM_RIGHT_CORNER].y) / 2;
+  const cheekMidY  = (lm[LM_LEFT_CHEEK].y  + lm[LM_RIGHT_CHEEK].y)  / 2;
+  const cheek      = cornerMidY - cheekMidY;  // positive = cheeks above corners
+
+  // Eye squint: eyelid aperture (vertical gap / face height proxy)
+  // Genuine laughter narrows the eyes (Duchenne marker)
+  const leftEyeH  = Math.abs(lm[LM_LEFT_EYE_TOP].y  - lm[LM_LEFT_EYE_BOT].y);
+  const rightEyeH = Math.abs(lm[LM_RIGHT_EYE_TOP].y - lm[LM_RIGHT_EYE_BOT].y);
+  const eyeApert  = (leftEyeH + rightEyeH) / 2;  // smaller = more squinted
+
+  return { mouth, cheek, eyeApert };
+}
+
 function initFaceDetection() {
-  detectionCanvas = document.createElement('canvas');
-  detectionCanvas.width = 320;
+  detectionCanvas       = document.createElement('canvas');
+  detectionCanvas.width  = 320;
   detectionCanvas.height = 240;
   detectionCtx = detectionCanvas.getContext('2d');
 
@@ -333,50 +456,80 @@ function initFaceDetection() {
     faceMesh = new FaceMesh({
       locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4/${file}`
     });
-    faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+    faceMesh.setOptions({
+      maxNumFaces: 1,
+      refineLandmarks: true,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
     faceMesh.onResults(onFaceResults);
-    faceMesh.initialize().then(() => { console.log('FaceMesh ready'); startDetectionLoop(); });
-  } catch (e) { console.warn('FaceMesh failed, manual mode'); faceMesh = null; enableManualButton(); }
-}
-
-const UPPER_LIP = 13, LOWER_LIP = 14, LEFT_CORNER = 78, RIGHT_CORNER = 308;
-
-function getLaughScore(lm) {
-  const openH = Math.abs(lm[LOWER_LIP].y - lm[UPPER_LIP].y);
-  const openW = Math.abs(lm[RIGHT_CORNER].x - lm[LEFT_CORNER].x);
-  if (openW < 0.001) return 0;
-  const ratio = openH / openW;
-  const cornerMidY = (lm[LEFT_CORNER].y + lm[RIGHT_CORNER].y) / 2;
-  const jawDrop = lm[LOWER_LIP].y - cornerMidY;
-  if (jawDrop < 0.01) return 0;
-  return ratio;
+    faceMesh.initialize().then(() => {
+      console.log('FaceMesh ready');
+      startDetectionLoop();
+    });
+  } catch (e) {
+    console.warn('FaceMesh failed, falling back to audio-only');
+    faceMesh = null;
+    enableManualButton();
+  }
 }
 
 function onFaceResults(results) {
   if (!results.multiFaceLandmarks || !results.multiFaceLandmarks.length) return;
   const lm = results.multiFaceLandmarks[0];
-  const ratio = getLaughScore(lm);
-  const threshold = baselineMouthRatio + LAUGH_THRESHOLD_OPEN_RATIO;
-  const pct = Math.min((ratio / (threshold * 1.2)) * 100, 100);
-  const bar = document.getElementById('mouth-indicator');
-  if (bar) { bar.style.width = pct + '%'; bar.style.background = ratio > threshold ? 'var(--danger)' : 'var(--accent)'; }
+  const { mouth, cheek, eyeApert } = getFaceFeatures(lm);
 
+  // Update mouth indicator bar (unchanged UX)
+  const mouthThresh = baselineMouth + 0.22;
+  const pct = Math.min((mouth / (mouthThresh * 1.2)) * 100, 100);
+  const bar = document.getElementById('mouth-indicator');
+  if (bar) {
+    bar.style.width      = pct + '%';
+    bar.style.background = mouth > mouthThresh ? 'var(--danger)' : 'var(--accent)';
+  }
+
+  // Calibration: collect samples
   if (calibrating) {
-    calibrationSamples.push(ratio);
+    calibrationSamples.push({ mouth, cheek, eyeApert });
     if (calibrationSamples.length >= CALIBRATION_FRAMES) finishCalibration();
     return;
   }
+
   if (!laughDetectionActive || laughTriggered) return;
 
-  const faceTriggered = ratio > threshold;
-  const audioConf = window._getAudioConfidence ? window._getAudioConfidence() : 0;
-  const strongFace = ratio > (baselineMouthRatio + LAUGH_THRESHOLD_OPEN_RATIO * 1.5);
-  const combined   = faceTriggered && audioConf >= LAUGH_THRESHOLD_AUDIO_ASSIST;
+  // Per-feature laugh scores (0–1)
+  // Mouth: how far above baseline + fixed threshold
+  const mouthDelta  = mouth - baselineMouth;
+  const mouthScore  = Math.min(Math.max(mouthDelta / 0.22, 0), 1);
 
-  if (strongFace || combined) {
+  // Cheek raise: cheek should be higher than baseline
+  const cheekDelta  = cheek - baselineCheek;
+  const cheekScore  = Math.min(Math.max(cheekDelta / 0.03, 0), 1);
+
+  // Eye squint: aperture should be SMALLER than baseline (eyes narrowing)
+  const eyeDelta    = baselineEye - eyeApert;
+  const eyeScore    = Math.min(Math.max(eyeDelta / 0.015, 0), 1);
+
+  // Combined face score — mouth is primary, cheek and eye are supporting
+  const faceScore   = Math.min(
+    (mouthScore * 0.60) + (cheekScore * 0.25) + (eyeScore * 0.15),
+    1
+  );
+
+  // Blended confidence
+  const blended = (faceScore * FACE_WEIGHT) + (_audioLaughConfidence * AUDIO_WEIGHT);
+
+  // Two trigger paths:
+  // 1. Blended signal exceeds threshold (normal case)
+  // 2. Face alone is extremely strong (e.g. audio muted)
+  const shouldAccumulate = blended >= COMBINED_TRIGGER_THRESHOLD || faceScore >= FACE_SOLO_THRESHOLD;
+
+  if (shouldAccumulate) {
     if (!laughStartTime) laughStartTime = Date.now();
     else if (Date.now() - laughStartTime > LAUGH_SUSTAIN_MS) triggerLaugh();
-  } else { laughStartTime = null; }
+  } else {
+    laughStartTime = null;
+  }
 }
 
 function startDetectionLoop() {
@@ -396,8 +549,24 @@ function startDetectionLoop() {
 
 function finishCalibration() {
   calibrating = false;
-  const avg = calibrationSamples.reduce((a, b) => a + b, 0) / calibrationSamples.length;
-  baselineMouthRatio = avg;
+  const n = calibrationSamples.length;
+  if (n === 0) return;
+
+  // Use mean of the middle 60% of samples (trim outliers)
+  const trimmed = (arr) => {
+    const sorted = [...arr].sort((a, b) => a - b);
+    const lo = Math.floor(n * 0.2), hi = Math.ceil(n * 0.8);
+    const slice = sorted.slice(lo, hi);
+    return slice.reduce((a, b) => a + b, 0) / slice.length;
+  };
+
+  baselineMouth = trimmed(calibrationSamples.map(s => s.mouth));
+  baselineCheek = trimmed(calibrationSamples.map(s => s.cheek));
+  baselineEye   = trimmed(calibrationSamples.map(s => s.eyeApert));
+
+  console.log('Calibrated — mouth:', baselineMouth.toFixed(4),
+              'cheek:', baselineCheek.toFixed(4),
+              'eye:', baselineEye.toFixed(4));
 }
 
 function triggerLaugh() {
@@ -425,7 +594,6 @@ function handlePlayerLaughed(id) {
   if (badge) badge.classList.add('visible');
 
   const activePlayers = playerOrder.filter(p => !laughedThisRound.has(p));
-
   if (maxPlayers === 2) {
     endRound();
   } else {
@@ -445,7 +613,7 @@ function endRound() {
   if (winnerId) scores[winnerId] = (scores[winnerId] || 0) + 1;
   updateScoreHUD();
 
-  const winsNeeded = Math.ceil(bestOf / 2);
+  const winsNeeded  = Math.ceil(bestOf / 2);
   const matchWinner = playerOrder.find(id => (scores[id] || 0) >= winsNeeded);
 
   if (matchWinner) {
@@ -457,19 +625,21 @@ function endRound() {
 }
 
 function showRoundResult(winnerId) {
-  const iWon = winnerId === me();
+  const iWon     = winnerId === me();
   const noWinner = winnerId === null;
   document.getElementById('round-emoji').textContent = noWinner ? '🤝' : iWon ? '🏆' : '😭';
   document.getElementById('round-title').textContent = noWinner ? 'everyone laughed' : iWon ? 'you held it!' : 'you laughed';
   document.getElementById('round-title').className   = 'result-title ' + (iWon ? 'win' : noWinner ? '' : 'lose');
-  document.getElementById('round-sub').textContent   = noWinner ? 'no points awarded' : iWon ? 'you win the round' : (winnerId ? 'player ' + (playerOrder.indexOf(winnerId) + 1) + ' wins the round' : '');
+  document.getElementById('round-sub').textContent   = noWinner ? 'no points awarded'
+    : iWon ? 'you win the round'
+    : winnerId ? 'player ' + (playerOrder.indexOf(winnerId) + 1) + ' wins the round' : '';
   document.getElementById('rs-you').textContent  = scores[me()] || 0;
   document.getElementById('rs-them').textContent = playerOrder.filter(id => id !== me()).map(id => scores[id] || 0).join(' / ');
 
   const btn = document.getElementById('next-btn');
-  btn.disabled = false;
+  btn.disabled    = false;
   btn.textContent = 'ready for next round →';
-  btn.onclick = requestNextRound;
+  btn.onclick     = requestNextRound;
   showScreen('round');
 }
 
@@ -485,24 +655,23 @@ function showGameOver(winnerId) {
   document.getElementById('over-sub').textContent = 'all time · you ' + allTimeMe + ' vs ' + allTimeOthers;
 
   const btn = document.getElementById('next-btn');
-  btn.disabled = false;
+  btn.disabled    = false;
   btn.textContent = 'rematch';
-  btn.onclick = requestRematch;
+  btn.onclick     = requestRematch;
   showScreen('over');
 }
 
 // ─── Next round — server-authoritative voting ─────────────
 function requestNextRound() {
-  const btn = document.getElementById('next-btn');
-  btn.disabled = true;
+  const btn       = document.getElementById('next-btn');
+  btn.disabled    = true;
   btn.textContent = 'waiting (1/' + playerOrder.length + ')...';
-  // Tell server I'm ready — server counts all votes and fires begin_round for everyone
   socket.emit('game_event', { code: roomCode, type: 'next_round_ready' });
 }
 
 function requestRematch() {
-  const btn = document.getElementById('next-btn');
-  btn.disabled = true;
+  const btn       = document.getElementById('next-btn');
+  btn.disabled    = true;
   btn.textContent = 'waiting (1/' + playerOrder.length + ')...';
   socket.emit('game_event', { code: roomCode, type: 'rematch_request' });
 }
@@ -537,10 +706,11 @@ async function resetGame() {
 // ─── Game flow ────────────────────────────────────────────
 function beginPrepPhase() {
   showScreen('game');
-  roundActive = false;
+  roundActive          = false;
   laughDetectionActive = false;
-  laughTriggered = false;
-  laughStartTime = null;
+  laughTriggered       = false;
+  laughStartTime       = null;
+  _audioLaughConfidence = 0;
   laughedThisRound.clear();
   document.getElementById('laugh-btn').disabled = true;
 
@@ -554,7 +724,11 @@ function beginPrepPhase() {
   updateTimerDisplay();
   setStatus('', false);
 
-  if (faceMesh) { calibrating = true; calibrationSamples = []; }
+  // Reset calibration for fresh baseline each round
+  if (faceMesh) {
+    calibrating        = true;
+    calibrationSamples = [];
+  }
 
   playerOrder.forEach(id => {
     const vid = document.getElementById('video-' + id);
@@ -593,11 +767,11 @@ function runCountdown(steps, onDone) {
 
 function goRound() {
   setStatus("😐  don't laugh.", true);
-  roundActive = true;
+  roundActive          = true;
   laughDetectionActive = true;
-  laughTriggered = false;
-  laughStartTime = null;
-  calibrating = false;
+  laughTriggered       = false;
+  laughStartTime       = null;
+  calibrating          = false;
   if (!faceMesh) document.getElementById('laugh-btn').disabled = false;
   startTimer();
 }
@@ -690,18 +864,18 @@ function leaveGame() { if (confirm('Leave the game?')) goLobby(); }
 
 function cleanup() {
   stopTimer();
-  detectionRunning = false;
-  laughDetectionActive = false;
-  calibrating = false;
+  detectionRunning      = false;
+  laughDetectionActive  = false;
+  calibrating           = false;
+  _audioLaughConfidence = 0;
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   for (const id in peers) { peers[id].close(); }
   peers = {};
   if (faceMesh) { faceMesh.close(); faceMesh = null; }
-  window._getAudioConfidence = null;
-  roomCode = null;
+  roomCode    = null;
   playerOrder = [];
-  scores = {};
+  scores      = {};
   allTimeScores = {};
   laughedThisRound.clear();
   document.getElementById('join-code').value = '';
