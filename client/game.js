@@ -88,7 +88,7 @@ let onnxWritePtr   = 0;
 let onnxFramesSinceInference = 0;
 
 const ONNX_SAMPLE_RATE = 8000;
-const ONNX_WINDOW_SIZE = 8000;   // 1-second window
+const ONNX_WINDOW_SIZE = 2680;   // 1-second window
 const ONNX_HOP_SIZE    = 800;    // run inference every 100 ms
 const ONNX_MODEL_PATH  = '/models/laughter_resnet.onnx';
 
@@ -202,6 +202,7 @@ async function loadOnnxModel() {
     onnxSession    = await ort.InferenceSession.create(ONNX_MODEL_PATH);
     onnxReady      = true;
     onnxRingBuffer = new Float32Array(ONNX_WINDOW_SIZE * 2);
+
     onnxWritePtr   = 0;
     console.log('ResNet laughter model loaded ✓');
     return true;
@@ -216,7 +217,6 @@ async function loadOnnxModel() {
 async function runOnnxInference() {
   if (!onnxReady || !onnxSession) return null;
   try {
-    // Extract 1-second window from ring buffer
     const clip = new Float32Array(ONNX_WINDOW_SIZE);
     for (let i = 0; i < ONNX_WINDOW_SIZE; i++) {
       clip[i] = onnxRingBuffer[(onnxWritePtr - ONNX_WINDOW_SIZE + i + onnxRingBuffer.length) % onnxRingBuffer.length];
@@ -226,18 +226,14 @@ async function runOnnxInference() {
     const tensor = new ort.Tensor('float32', data, [1, 1, nFilters, nFrames]);
     const output = await onnxSession.run({ input: tensor });
 
-    // Model outputs logits or softmax probabilities for [non-laugh, laugh]
     const raw = output[Object.keys(output)[0]].data;
-    // Apply softmax if logits (safe either way)
-    const expNL = Math.exp(raw[0]);
-    const expL  = Math.exp(raw[1]);
-    return expL / (expNL + expL);
+    // Model outputs a single sigmoid value — just use it directly
+    return Math.min(Math.max(raw[0], 0), 1);
   } catch (e) {
     console.warn('ONNX inference error:', e);
     return null;
   }
 }
-
 // ─── Socket handlers ──────────────────────────────────────
 socket.on('room_created', (code) => {
   roomCode = code;
