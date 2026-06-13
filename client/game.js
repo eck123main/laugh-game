@@ -725,22 +725,27 @@ function onFaceResults(results) {
 
   const mouthDelta = mouth - baselineMouth;
   const mouthScore = Math.min(Math.max(mouthDelta / 0.22, 0), 1);
-
   const cheekDelta = cheek - baselineCheek;
   const cheekScore = Math.min(Math.max(cheekDelta / 0.03, 0), 1);
+  const eyeDelta   = baselineEye - eyeApert;
+  const eyeScore   = Math.min(Math.max(eyeDelta / 0.015, 0), 1);
+  const faceScore  = Math.min((mouthScore * 0.60) + (cheekScore * 0.25) + (eyeScore * 0.15), 1);
+  const blended    = (faceScore * FACE_WEIGHT) + (_audioLaughConfidence * AUDIO_WEIGHT);
 
-  const eyeDelta  = baselineEye - eyeApert;
-  const eyeScore  = Math.min(Math.max(eyeDelta / 0.015, 0), 1);
+  // ── ADD THIS ──
+  if (Math.random() < 0.05) { // log ~5% of frames to avoid spam
+    console.log(
+      'face:', faceScore.toFixed(2),
+      '| audio:', _audioLaughConfidence.toFixed(2),
+      '| blended:', blended.toFixed(2),
+      '| mouth:', mouthScore.toFixed(2),
+      '| cheek:', cheekScore.toFixed(2),
+      '| eye:', eyeScore.toFixed(2)
+    );
+  }
+  // ─────────────
 
-  const faceScore = Math.min(
-    (mouthScore * 0.60) + (cheekScore * 0.25) + (eyeScore * 0.15),
-    1
-  );
-
-  // Blend with audio confidence (ONNX or heuristic — same variable either way)
-  const blended = (faceScore * FACE_WEIGHT) + (_audioLaughConfidence * AUDIO_WEIGHT);
   const shouldAccumulate = blended >= COMBINED_TRIGGER_THRESHOLD || faceScore >= FACE_SOLO_THRESHOLD;
-
   if (shouldAccumulate) {
     if (!laughStartTime) laughStartTime = Date.now();
     else if (Date.now() - laughStartTime > LAUGH_SUSTAIN_MS) triggerLaugh();
@@ -748,7 +753,6 @@ function onFaceResults(results) {
     laughStartTime = null;
   }
 }
-
 function startDetectionLoop() {
   if (detectionRunning) return;
   detectionRunning = true;
