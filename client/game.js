@@ -32,12 +32,11 @@ const LAUGH_THRESHOLD_AUDIO_ASSIST  = 0.35;
 let localStream;
 let roomCode = null;
 
-// Use socket.id directly — never cache into myId variable to avoid stale reads
 const socket = io();
-const me = () => socket.id;
+const me = () => socket.id;   // always live, never stale
 
-let peers = {};          // peerId -> RTCPeerConnection
-let playerOrder = [];    // ordered list of socket IDs, index = slot
+let peers = {};
+let playerOrder = [];
 let maxPlayers = 2;
 let bestOf = 5;
 let selectedBestOf = 5;
@@ -46,15 +45,13 @@ let selectedMaxPlayers = 2;
 let timerInterval = null;
 let timerSecs = 0;
 
-let scores = {};         // id -> round wins this match
-let allTimeScores = {};  // id -> total wins across rematches
+let scores = {};
+let allTimeScores = {};
 
 let laughedThisRound = new Set();
-let nextRoundVotes = new Set();
 let roundActive = false;
 let audioCtx = null;
 
-// Detection state
 let faceMesh = null;
 let laughDetectionActive = false;
 let laughStartTime = null;
@@ -75,7 +72,6 @@ socket.on('room_created', (code) => {
 
 socket.on('room_joined', (code) => {
   roomCode = code;
-  // Camera starts when game_start fires
 });
 
 socket.on('room_update', ({ players, maxPlayers: mp }) => {
@@ -104,7 +100,7 @@ socket.on('game_start', async ({ bestOf: bo, players, maxPlayers: mp }) => {
   initAudioDetection();
 
   // WebRTC mesh: player at index I offers to all players at index < I.
-  // Lower-index players wait for the offer — no races, exactly one offerer per pair.
+  // Exactly one offerer per pair, no races.
   const myIndex = playerOrder.indexOf(me());
   for (let i = 0; i < myIndex; i++) {
     await offerTo(playerOrder[i]);
@@ -116,14 +112,14 @@ socket.on('game_start', async ({ bestOf: bo, players, maxPlayers: mp }) => {
 socket.on('game_event', async ({ type, data, fromId }) => {
   switch (type) {
 
+    // ── WebRTC signalling ──
     case 'offer': {
       const pc = getOrCreatePC(fromId);
       await pc.setRemoteDescription(new RTCSessionDescription(data));
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       socket.emit('game_event', {
-        code: roomCode,
-        type: 'answer',
+        code: roomCode, type: 'answer',
         data: { sdp: answer, targetId: fromId }
       });
       break;
@@ -135,25 +131,38 @@ socket.on('game_event', async ({ type, data, fromId }) => {
     }
     case 'ice': {
       const pc = peers[fromId];
-      if (pc && data.candidate) {
-        pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(() => {});
-      }
+      if (pc && data.candidate) pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(() => {});
       break;
     }
 
+    // ── Game events ──
     case 'i_laughed':
       handlePlayerLaughed(fromId);
       break;
 
-    case 'next_round_ready':
-      handleNextRoundVote(fromId);
-      break;
-
-    case 'rematch_vote': {
+    // Server tells us how many have voted so far — update button label
+    case 'next_round_vote_update': {
       const btn = document.getElementById('next-btn');
-      if (btn) btn.textContent = 'waiting (' + data.votes + '/' + data.needed + ')...';
+      if (btn && btn.disabled) {
+        btn.textContent = 'waiting (' + data.votes + '/' + data.needed + ')...';
+      }
       break;
     }
+
+    // Server says everyone is ready — all clients begin the round together
+    case 'begin_round':
+      beginPrepPhase();
+      break;
+
+    // Server tells us rematch vote progress
+    case 'rematch_vote': {
+      const btn = document.getElementById('next-btn');
+      if (btn && btn.disabled) {
+        btn.textContent = 'waiting (' + data.votes + '/' + data.needed + ')...';
+      }
+      break;
+    }
+
     case 'rematch_go':
       if (data?.bestOf) bestOf = data.bestOf;
       resetGame();
@@ -177,9 +186,7 @@ function getOrCreatePC(peerId) {
   const pc = new RTCPeerConnection(RTC_CONFIG);
   peers[peerId] = pc;
 
-  if (localStream) {
-    localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-  }
+  if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
   pc.ontrack = (e) => {
     const vid = document.getElementById('video-' + peerId);
@@ -192,8 +199,7 @@ function getOrCreatePC(peerId) {
 
   pc.onicecandidate = (e) => {
     socket.emit('game_event', {
-      code: roomCode,
-      type: 'ice',
+      code: roomCode, type: 'ice',
       data: { candidate: e.candidate, targetId: peerId }
     });
   };
@@ -206,8 +212,7 @@ async function offerTo(peerId) {
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   socket.emit('game_event', {
-    code: roomCode,
-    type: 'offer',
+    code: roomCode, type: 'offer',
     data: { ...offer, targetId: peerId }
   });
 }
@@ -219,12 +224,10 @@ async function startCamera() {
     localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
     const vid = document.getElementById('video-' + me());
     if (vid) { vid.srcObject = localStream; vid.muted = true; hideOverlay('overlay-' + me()); }
-  } catch (e) {
-    console.warn('Camera unavailable:', e);
-  }
+  } catch (e) { console.warn('Camera unavailable:', e); }
 }
 
-// ─── Camera grid builder ──────────────────────────────────
+// ─── Camera grid ──────────────────────────────────────────
 function buildCamGrid(players) {
   const cams = document.getElementById('cams');
   cams.innerHTML = '';
@@ -241,10 +244,7 @@ function buildCamGrid(players) {
     vid.id = 'video-' + id;
     vid.autoplay = true;
     vid.playsinline = true;
-    if (isMe) {
-      vid.muted = true;
-      if (localStream) vid.srcObject = localStream;
-    }
+    if (isMe) { vid.muted = true; if (localStream) vid.srcObject = localStream; }
 
     const overlay = document.createElement('div');
     overlay.className = 'cam-overlay';
@@ -254,7 +254,6 @@ function buildCamGrid(players) {
 
     const label = document.createElement('div');
     label.className = 'cam-label' + (isMe ? ' you' : '');
-    label.id = 'cam-label-' + id;
     label.innerHTML = isMe ? '<span class="live-dot"></span>you' : 'player ' + (i + 1);
 
     const laughBadge = document.createElement('div');
@@ -285,7 +284,6 @@ function initAudioDetection() {
     const binHz = audioCtx.sampleRate / analyser.fftSize;
     const laughLow  = Math.floor(300  / binHz);
     const laughHigh = Math.ceil(3000  / binHz);
-
     const pulseHistory = [];
     let lastEnergyState = false;
     let audioLaughConfidence = 0;
@@ -301,7 +299,6 @@ function initAudioDetection() {
       for (let i = laughLow; i <= laughHigh; i++) bandSum += dataArray[i];
       const bandAvg   = bandSum / (laughHigh - laughLow + 1);
       const bandRatio = bandAvg / (totalAvg + 1);
-
       const now = Date.now();
       const isHigh = bandAvg > 45;
       if (isHigh && !lastEnergyState) pulseHistory.push(now);
@@ -309,7 +306,6 @@ function initAudioDetection() {
       const cutoff = now - 500;
       while (pulseHistory.length && pulseHistory[0] < cutoff) pulseHistory.shift();
       const pulseCount = pulseHistory.length;
-
       const spectralOk = bandRatio > 0.5;
       const rhythmOk   = pulseCount >= 2 && pulseCount <= 8;
       audioLaughConfidence = (spectralOk ? 0.5 : 0) + (rhythmOk ? 0.5 : 0);
@@ -340,11 +336,7 @@ function initFaceDetection() {
     faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
     faceMesh.onResults(onFaceResults);
     faceMesh.initialize().then(() => { console.log('FaceMesh ready'); startDetectionLoop(); });
-  } catch (e) {
-    console.warn('FaceMesh failed, manual mode');
-    faceMesh = null;
-    enableManualButton();
-  }
+  } catch (e) { console.warn('FaceMesh failed, manual mode'); faceMesh = null; enableManualButton(); }
 }
 
 const UPPER_LIP = 13, LOWER_LIP = 14, LEFT_CORNER = 78, RIGHT_CORNER = 308;
@@ -476,7 +468,7 @@ function showRoundResult(winnerId) {
 
   const btn = document.getElementById('next-btn');
   btn.disabled = false;
-  btn.textContent = 'next round →';
+  btn.textContent = 'ready for next round →';
   btn.onclick = requestNextRound;
   showScreen('round');
 }
@@ -491,31 +483,21 @@ function showGameOver(winnerId) {
   document.getElementById('os-you').textContent   = allTimeMe;
   document.getElementById('os-them').textContent  = allTimeOthers;
   document.getElementById('over-sub').textContent = 'all time · you ' + allTimeMe + ' vs ' + allTimeOthers;
+
+  const btn = document.getElementById('next-btn');
+  btn.disabled = false;
+  btn.textContent = 'rematch';
+  btn.onclick = requestRematch;
   showScreen('over');
 }
 
-// ─── Next round voting ────────────────────────────────────
-function handleNextRoundVote(fromId) {
-  nextRoundVotes.add(fromId);
-  const others = playerOrder.filter(id => id !== me());
-  if (others.every(id => nextRoundVotes.has(id))) {
-    nextRoundVotes.clear();
-    beginPrepPhase();
-  }
-}
-
+// ─── Next round — server-authoritative voting ─────────────
 function requestNextRound() {
   const btn = document.getElementById('next-btn');
   btn.disabled = true;
-  btn.textContent = 'waiting for others...';
-  nextRoundVotes.add(me());
-  const others = playerOrder.filter(id => id !== me());
-  if (others.every(id => nextRoundVotes.has(id))) {
-    nextRoundVotes.clear();
-    beginPrepPhase();
-  } else {
-    socket.emit('game_event', { code: roomCode, type: 'next_round_ready' });
-  }
+  btn.textContent = 'waiting (1/' + playerOrder.length + ')...';
+  // Tell server I'm ready — server counts all votes and fires begin_round for everyone
+  socket.emit('game_event', { code: roomCode, type: 'next_round_ready' });
 }
 
 function requestRematch() {
@@ -529,7 +511,6 @@ async function resetGame() {
   playerOrder.forEach(id => { scores[id] = 0; });
   laughTriggered = false;
   laughedThisRound.clear();
-  nextRoundVotes.clear();
   updateScoreHUD();
 
   for (const id in peers) { peers[id].close(); }
@@ -549,11 +530,8 @@ async function resetGame() {
   beginPrepPhase();
 
   await new Promise(res => setTimeout(res, 800));
-
   const myIndex = playerOrder.indexOf(me());
-  for (let i = 0; i < myIndex; i++) {
-    await offerTo(playerOrder[i]);
-  }
+  for (let i = 0; i < myIndex; i++) await offerTo(playerOrder[i]);
 }
 
 // ─── Game flow ────────────────────────────────────────────
@@ -725,7 +703,6 @@ function cleanup() {
   scores = {};
   allTimeScores = {};
   laughedThisRound.clear();
-  nextRoundVotes.clear();
   document.getElementById('join-code').value = '';
   document.getElementById('timer').classList.remove('danger');
 }

@@ -19,7 +19,8 @@ io.on('connection', (socket) => {
       players: [socket.id],
       maxPlayers: maxPlayers || 2,
       bestOf: bestOf || 5,
-      rematchVotes: new Set()
+      rematchVotes: new Set(),
+      nextRoundVotes: new Set(),
     };
     socket.join(code);
     socket.data.roomCode = code;
@@ -53,23 +54,36 @@ io.on('connection', (socket) => {
     const room = rooms[code];
     if (!room) return;
 
-    if (type === 'rematch_request') {
+    if (type === 'next_round_ready') {
+      room.nextRoundVotes.add(socket.id);
+      // Tell everyone the current vote count so they can show progress
+      io.to(code).emit('game_event', {
+        type: 'next_round_vote_update',
+        data: { votes: room.nextRoundVotes.size, needed: room.players.length }
+      });
+      // When everyone has voted, fire begin_round for all
+      if (room.nextRoundVotes.size >= room.players.length) {
+        room.nextRoundVotes.clear();
+        io.to(code).emit('game_event', { type: 'begin_round' });
+      }
+
+    } else if (type === 'rematch_request') {
       room.rematchVotes.add(socket.id);
+      io.to(code).emit('game_event', {
+        type: 'rematch_vote',
+        data: { votes: room.rematchVotes.size, needed: room.players.length }
+      });
       if (room.rematchVotes.size >= room.players.length) {
         room.rematchVotes.clear();
+        room.nextRoundVotes.clear();
         io.to(code).emit('game_event', { type: 'rematch_go', data: { bestOf: room.bestOf } });
-      } else {
-        socket.to(code).emit('game_event', {
-          type: 'rematch_vote',
-          data: { votes: room.rematchVotes.size, needed: room.players.length },
-          fromId: socket.id
-        });
       }
+
     } else if (data && data.targetId) {
-      // Targeted signalling message (WebRTC offer/answer/ice)
+      // Targeted WebRTC signalling
       io.to(data.targetId).emit('game_event', { type, data, fromId: socket.id });
     } else {
-      // Broadcast to everyone else in the room
+      // Broadcast to everyone else
       socket.to(code).emit('game_event', { type, data, fromId: socket.id });
     }
   });
@@ -79,6 +93,8 @@ io.on('connection', (socket) => {
     if (!code || !rooms[code]) return;
     const room = rooms[code];
     room.players = room.players.filter(id => id !== socket.id);
+    room.nextRoundVotes.delete(socket.id);
+    room.rematchVotes.delete(socket.id);
     if (room.players.length === 0) {
       delete rooms[code];
     } else {
