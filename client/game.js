@@ -2,6 +2,7 @@ document.addEventListener('DOMContentLoaded', () => {
   showScreen('lobby');
   setBestOf(5);
   setMaxPlayers(2);
+  setGameMode('standard');
 });
 
 const RTC_CONFIG = {
@@ -23,13 +24,13 @@ const RTC_CONFIG = {
 };
 
 // ─── Detection thresholds ─────────────────────────────────
-const LAUGH_SUSTAIN_MS            = 850;   // ms face+audio must agree before trigger
-const CALIBRATION_FRAMES          = 90;    // frames to collect during prep phase
-const FACE_WEIGHT                 = 0.55;  // face vs audio blend
+const LAUGH_SUSTAIN_MS            = 850;
+const CALIBRATION_FRAMES          = 90;
+const FACE_WEIGHT                 = 0.55;
 const AUDIO_WEIGHT                = 0.45;
-const COMBINED_TRIGGER_THRESHOLD  = 0.62;  // blended score needed to start sustain timer
-const FACE_SOLO_THRESHOLD         = 0.80;  // face alone can trigger if very strong
-const AUDIO_SOLO_THRESHOLD        = 0.85;  // audio alone can trigger if extremely strong
+const COMBINED_TRIGGER_THRESHOLD  = 0.62;
+const FACE_SOLO_THRESHOLD         = 0.80;
+const AUDIO_SOLO_THRESHOLD        = 0.85;
 
 // ─── State ────────────────────────────────────────────────
 let localStream;
@@ -39,11 +40,18 @@ const socket = io();
 const me = () => socket.id;
 
 let peers = {};
-let playerOrder = [];
+let playerOrder = [];    // all players (including eliminated/spectators)
 let maxPlayers = 2;
 let bestOf = 5;
 let selectedBestOf = 5;
 let selectedMaxPlayers = 2;
+let selectedGameMode = 'standard';  // 'standard' | 'elimination'
+let gameMode = 'standard';
+
+// Elimination state
+let activePlayers = [];      // players still competing
+let eliminatedPlayers = [];  // players knocked out (spectators)
+let eliminationFinals = false;  // true when we're down to 2 in elimination mode
 
 let timerInterval = null;
 let timerSecs = 0;
@@ -60,17 +68,15 @@ let laughDetectionActive = false;
 let laughStartTime = null;
 let laughTriggered = false;
 
-// Calibration baselines — mouth, cheek raise delta, eye squint delta
 let baselineMouth  = 0.025;
 let baselineCheek  = 0;
 let baselineEye    = 0;
 let calibrating    = false;
-let calibrationSamples = [];   // [{mouth, cheek, eye}]
+let calibrationSamples = [];
 
 let detectionCanvas, detectionCtx;
 let detectionRunning = false;
 
-// Shared audio confidence (written by audio loop, read by face loop)
 let _audioLaughConfidence = 0;
 
 // ─── Socket handlers ──────────────────────────────────────
@@ -95,10 +101,16 @@ socket.on('error', (msg) => {
   document.getElementById('lobby-error').textContent = msg;
 });
 
-socket.on('game_start', async ({ bestOf: bo, players, maxPlayers: mp }) => {
-  bestOf = bo || 5;
+socket.on('game_start', async ({ bestOf: bo, players, maxPlayers: mp, gameMode: gm }) => {
+  bestOf    = bo || 5;
   maxPlayers = mp || 2;
+  gameMode  = gm || 'standard';
   playerOrder = players;
+
+  // Elimination setup
+  activePlayers    = [...players];
+  eliminatedPlayers = [];
+  eliminationFinals = false;
 
   scores = {};
   allTimeScores = {};
@@ -178,7 +190,9 @@ socket.on('opponent_left', ({ id }) => {
   const slot = document.getElementById('cam-slot-' + id);
   if (slot) slot.remove();
   if (peers[id]) { peers[id].close(); delete peers[id]; }
-  playerOrder = playerOrder.filter(p => p !== id);
+  playerOrder      = playerOrder.filter(p => p !== id);
+  activePlayers    = activePlayers.filter(p => p !== id);
+  eliminatedPlayers = eliminatedPlayers.filter(p => p !== id);
   alert('A player disconnected.');
   goLobby();
 });
@@ -230,19 +244,25 @@ async function startCamera() {
 function buildCamGrid(players) {
   const cams = document.getElementById('cams');
   cams.innerHTML = '';
-  cams.className = 'cams players-' + players.length;
+
+  const activeCount = activePlayers.length;
+  updateCamsClass(cams, activeCount, eliminatedPlayers.length);
 
   players.forEach((id, i) => {
-    const isMe = id === me();
+    const isMe        = id === me();
+    const isEliminated = eliminatedPlayers.includes(id);
     const wrap = document.createElement('div');
-    wrap.className = 'cam-wrap';
+    wrap.className = 'cam-wrap' + (isEliminated ? ' spectator' : '');
     wrap.id = 'cam-slot-' + id;
 
     const vid = document.createElement('video');
     vid.id = 'video-' + id;
     vid.autoplay = true;
     vid.playsinline = true;
-    if (isMe) { vid.muted = true; if (localStream) vid.srcObject = localStream; }
+    if (isMe) {
+      vid.muted = true;
+      if (localStream) vid.srcObject = localStream;
+    }
 
     const overlay = document.createElement('div');
     overlay.className = 'cam-overlay';
@@ -252,24 +272,62 @@ function buildCamGrid(players) {
 
     const label = document.createElement('div');
     label.className = 'cam-label' + (isMe ? ' you' : '');
-    label.innerHTML = isMe ? '<span class="live-dot"></span>you' : 'player ' + (i + 1);
+    label.innerHTML = isMe ? '<span class="live-dot"></span>you' : 'player ' + (playerOrder.indexOf(id) + 1);
 
     const laughBadge = document.createElement('div');
     laughBadge.className = 'laugh-badge';
     laughBadge.id = 'laugh-badge-' + id;
     laughBadge.textContent = '😂';
 
+    const outBadge = document.createElement('div');
+    outBadge.className = 'out-badge';
+    outBadge.id = 'out-badge-' + id;
+    outBadge.textContent = '💀';
+    if (isEliminated) outBadge.classList.add('visible');
+
     wrap.appendChild(vid);
     wrap.appendChild(overlay);
     wrap.appendChild(label);
     wrap.appendChild(laughBadge);
+    wrap.appendChild(outBadge);
     cams.appendChild(wrap);
   });
 }
 
-// ─── Audio Detection (improved) ───────────────────────────
-// Uses mel-filterbank approximation with spectral centroid, rolloff,
-// flux, and ZCR — much more discriminative than raw band energy.
+// Set the correct CSS classes on .cams based on current active/spectator counts
+function updateCamsClass(cams, activeCount, spectatorCount) {
+  // Strip all players-N and has-spectators classes
+  cams.className = cams.className.replace(/players-\d+/g, '').replace('has-spectators', '').trim();
+  cams.classList.add('cams');
+  cams.classList.add('players-' + Math.max(activeCount, 1));
+  if (spectatorCount > 0) cams.classList.add('has-spectators');
+}
+
+// Called when a player is eliminated in elimination mode
+function eliminatePlayer(id) {
+  if (eliminatedPlayers.includes(id)) return;
+  eliminatedPlayers.push(id);
+  activePlayers = activePlayers.filter(p => p !== id);
+
+  const wrap = document.getElementById('cam-slot-' + id);
+  if (wrap) {
+    wrap.classList.add('spectator');
+    // Show skull badge
+    const outBadge = document.getElementById('out-badge-' + id);
+    if (outBadge) outBadge.classList.add('visible');
+    // Mute their audio track in the peer connection
+    const vid = document.getElementById('video-' + id);
+    if (vid && vid.srcObject) {
+      vid.srcObject.getAudioTracks().forEach(t => { t.enabled = false; });
+    }
+  }
+
+  // Reflow the grid
+  const cams = document.getElementById('cams');
+  updateCamsClass(cams, activePlayers.length, eliminatedPlayers.length);
+}
+
+// ─── Audio Detection ──────────────────────────────────────
 function initAudioDetection() {
   if (!localStream || audioCtx) return;
   try {
@@ -281,11 +339,10 @@ function initAudioDetection() {
     analyser.fftSize = 1024;
     source.connect(analyser);
 
-    const bufLen  = analyser.frequencyBinCount;  // 512
+    const bufLen  = analyser.frequencyBinCount;
     const dataArr = new Uint8Array(bufLen);
     const binHz   = audioCtx.sampleRate / analyser.fftSize;
 
-    // Mel-spaced filterbank: 12 bands, 300–4000 Hz
     const MEL_BANDS = 12;
     const melLow    = 300;
     const melHigh   = 4000;
@@ -299,9 +356,8 @@ function initAudioDetection() {
     }
 
     let prevBands    = new Array(MEL_BANDS).fill(0);
-    let prevFlux     = 0;
-    let zcBuffer     = [];   // recent zero-crossing rates
-    let energyBuffer = [];   // recent RMS energy values
+    let zcBuffer     = [];
+    let energyBuffer = [];
     let fluxBuffer   = [];
     const BUF_SIZE   = 20;
 
@@ -309,12 +365,10 @@ function initAudioDetection() {
       if (!audioCtx) return;
       analyser.getByteFrequencyData(dataArr);
 
-      // Overall RMS energy
       let rmsSum = 0;
       for (let i = 0; i < bufLen; i++) rmsSum += (dataArr[i] / 255) ** 2;
       const rms = Math.sqrt(rmsSum / bufLen);
 
-      // Silence gate
       if (rms < 0.02) {
         _audioLaughConfidence = 0;
         prevBands.fill(0);
@@ -322,27 +376,21 @@ function initAudioDetection() {
         return;
       }
 
-      // Mel filterbank energies
       const bands = new Array(MEL_BANDS).fill(0);
       let totalEnergy = 0;
       for (let b = 0; b < MEL_BANDS; b++) {
         const lo = melPoints[b], hi = melPoints[b + 2];
         let sum = 0, cnt = 0;
-        for (let k = lo; k <= Math.min(hi, bufLen - 1); k++) {
-          sum += dataArr[k];
-          cnt++;
-        }
+        for (let k = lo; k <= Math.min(hi, bufLen - 1); k++) { sum += dataArr[k]; cnt++; }
         bands[b] = cnt > 0 ? sum / cnt : 0;
         totalEnergy += bands[b];
       }
       if (totalEnergy < 1) { _audioLaughConfidence = 0; requestAnimationFrame(audioLoop); return; }
 
-      // Spectral centroid (normalised to 0–1 over mel range)
       let centNum = 0, centDen = 0;
       for (let b = 0; b < MEL_BANDS; b++) { centNum += b * bands[b]; centDen += bands[b]; }
       const centroid = centDen > 0 ? centNum / (centDen * (MEL_BANDS - 1)) : 0;
 
-      // Spectral rolloff: band index where cumulative energy hits 85%
       let cum = 0, rolloff = MEL_BANDS - 1;
       for (let b = 0; b < MEL_BANDS; b++) {
         cum += bands[b];
@@ -350,38 +398,29 @@ function initAudioDetection() {
       }
       const rolloffNorm = rolloff / (MEL_BANDS - 1);
 
-      // Spectral flux (frame-to-frame change)
       let flux = 0;
       for (let b = 0; b < MEL_BANDS; b++) flux += Math.abs(bands[b] - prevBands[b]);
       flux /= (MEL_BANDS * 255);
       prevBands = [...bands];
 
-      // Zero-crossing rate proxy: high-freq band ratio (bands 8–11 vs all)
       let hfSum = 0;
       for (let b = 8; b < MEL_BANDS; b++) hfSum += bands[b];
       const zcr = totalEnergy > 0 ? hfSum / totalEnergy : 0;
 
-      // Rolling buffers
       const push = (buf, val) => { buf.push(val); if (buf.length > BUF_SIZE) buf.shift(); };
       push(energyBuffer, rms);
       push(fluxBuffer,   flux);
       push(zcBuffer,     zcr);
 
-      const avgFlux  = fluxBuffer.reduce((a, b) => a + b, 0) / fluxBuffer.length;
-      const avgZcr   = zcBuffer.reduce((a, b) => a + b, 0) / zcBuffer.length;
+      const avgFlux = fluxBuffer.reduce((a, b) => a + b, 0) / fluxBuffer.length;
+      const avgZcr  = zcBuffer.reduce((a, b) => a + b, 0)   / zcBuffer.length;
 
-      // Laugh audio signature:
-      // - centroid 0.35–0.75  (voiced mid-freq, not low rumble or hiss)
-      // - rolloff   0.5–0.9   (energy spread across mid–high bands)
-      // - flux > 0.015        (irregular, rhythmic bursts — not sustained tone)
-      // - zcr 0.2–0.6         (voiced but not pure noise)
       const centroidScore = (centroid > 0.30 && centroid < 0.80) ? 1 : 0;
       const rolloffScore  = (rolloffNorm > 0.45 && rolloffNorm < 0.92) ? 1 : 0;
-      const fluxScore     = Math.min(avgFlux / 0.04, 1);          // 0–1
+      const fluxScore     = Math.min(avgFlux / 0.04, 1);
       const zcrScore      = (avgZcr > 0.15 && avgZcr < 0.65) ? 1 : 0;
-      const energyScore   = Math.min(rms / 0.12, 1);              // 0–1, rewards louder
+      const energyScore   = Math.min(rms / 0.12, 1);
 
-      // Weighted combination — flux and energy are continuous, rest are binary gates
       _audioLaughConfidence = Math.min(
         (centroidScore * 0.20) +
         (rolloffScore  * 0.20) +
@@ -391,7 +430,6 @@ function initAudioDetection() {
         1
       );
 
-      // Audio-solo mode (no FaceMesh): trigger if extremely confident
       if (laughDetectionActive && !laughTriggered && !faceMesh) {
         if (_audioLaughConfidence >= AUDIO_SOLO_THRESHOLD) {
           if (!laughStartTime) laughStartTime = Date.now();
@@ -407,47 +445,36 @@ function initAudioDetection() {
   } catch (e) { console.warn('Audio detection unavailable:', e); }
 }
 
-// ─── Face Detection (improved) ────────────────────────────
-// Tracks mouth open ratio, cheek raise, and eye squint.
-// All three signals are calibrated individually during prep phase.
-
-// Landmark indices (MediaPipe Face Mesh)
+// ─── Face Detection ───────────────────────────────────────
 const LM_UPPER_LIP    = 13;
 const LM_LOWER_LIP    = 14;
 const LM_LEFT_CORNER  = 78;
 const LM_RIGHT_CORNER = 308;
-const LM_LEFT_CHEEK   = 50;   // left cheek apex
-const LM_RIGHT_CHEEK  = 280;  // right cheek apex
-const LM_LEFT_EYE_TOP = 159;  // left upper eyelid
-const LM_LEFT_EYE_BOT = 145;  // left lower eyelid
+const LM_LEFT_CHEEK   = 50;
+const LM_RIGHT_CHEEK  = 280;
+const LM_LEFT_EYE_TOP = 159;
+const LM_LEFT_EYE_BOT = 145;
 const LM_RIGHT_EYE_TOP= 386;
 const LM_RIGHT_EYE_BOT= 374;
-// Nose tip as a stable vertical reference
-const LM_NOSE_TIP     = 1;
 
 function getFaceFeatures(lm) {
-  // Mouth openness (height / width ratio)
   const mouthH = Math.abs(lm[LM_LOWER_LIP].y - lm[LM_UPPER_LIP].y);
   const mouthW = Math.abs(lm[LM_RIGHT_CORNER].x - lm[LM_LEFT_CORNER].x);
   const mouth  = mouthW > 0.001 ? mouthH / mouthW : 0;
 
-  // Cheek raise: how far cheek apexes are above mouth corners.
-  // Laughter pulls cheeks up, reducing this delta.
   const cornerMidY = (lm[LM_LEFT_CORNER].y + lm[LM_RIGHT_CORNER].y) / 2;
   const cheekMidY  = (lm[LM_LEFT_CHEEK].y  + lm[LM_RIGHT_CHEEK].y)  / 2;
-  const cheek      = cornerMidY - cheekMidY;  // positive = cheeks above corners
+  const cheek      = cornerMidY - cheekMidY;
 
-  // Eye squint: eyelid aperture (vertical gap / face height proxy)
-  // Genuine laughter narrows the eyes (Duchenne marker)
   const leftEyeH  = Math.abs(lm[LM_LEFT_EYE_TOP].y  - lm[LM_LEFT_EYE_BOT].y);
   const rightEyeH = Math.abs(lm[LM_RIGHT_EYE_TOP].y - lm[LM_RIGHT_EYE_BOT].y);
-  const eyeApert  = (leftEyeH + rightEyeH) / 2;  // smaller = more squinted
+  const eyeApert  = (leftEyeH + rightEyeH) / 2;
 
   return { mouth, cheek, eyeApert };
 }
 
 function initFaceDetection() {
-  detectionCanvas       = document.createElement('canvas');
+  detectionCanvas        = document.createElement('canvas');
   detectionCanvas.width  = 320;
   detectionCanvas.height = 240;
   detectionCtx = detectionCanvas.getContext('2d');
@@ -479,7 +506,6 @@ function onFaceResults(results) {
   const lm = results.multiFaceLandmarks[0];
   const { mouth, cheek, eyeApert } = getFaceFeatures(lm);
 
-  // Update mouth indicator bar (unchanged UX)
   const mouthThresh = baselineMouth + 0.22;
   const pct = Math.min((mouth / (mouthThresh * 1.2)) * 100, 100);
   const bar = document.getElementById('mouth-indicator');
@@ -488,7 +514,6 @@ function onFaceResults(results) {
     bar.style.background = mouth > mouthThresh ? 'var(--danger)' : 'var(--accent)';
   }
 
-  // Calibration: collect samples
   if (calibrating) {
     calibrationSamples.push({ mouth, cheek, eyeApert });
     if (calibrationSamples.length >= CALIBRATION_FRAMES) finishCalibration();
@@ -497,31 +522,21 @@ function onFaceResults(results) {
 
   if (!laughDetectionActive || laughTriggered) return;
 
-  // Per-feature laugh scores (0–1)
-  // Mouth: how far above baseline + fixed threshold
-  const mouthDelta  = mouth - baselineMouth;
-  const mouthScore  = Math.min(Math.max(mouthDelta / 0.22, 0), 1);
+  const mouthDelta = mouth - baselineMouth;
+  const mouthScore = Math.min(Math.max(mouthDelta / 0.22, 0), 1);
 
-  // Cheek raise: cheek should be higher than baseline
-  const cheekDelta  = cheek - baselineCheek;
-  const cheekScore  = Math.min(Math.max(cheekDelta / 0.03, 0), 1);
+  const cheekDelta = cheek - baselineCheek;
+  const cheekScore = Math.min(Math.max(cheekDelta / 0.03, 0), 1);
 
-  // Eye squint: aperture should be SMALLER than baseline (eyes narrowing)
-  const eyeDelta    = baselineEye - eyeApert;
-  const eyeScore    = Math.min(Math.max(eyeDelta / 0.015, 0), 1);
+  const eyeDelta   = baselineEye - eyeApert;
+  const eyeScore   = Math.min(Math.max(eyeDelta / 0.015, 0), 1);
 
-  // Combined face score — mouth is primary, cheek and eye are supporting
-  const faceScore   = Math.min(
+  const faceScore  = Math.min(
     (mouthScore * 0.60) + (cheekScore * 0.25) + (eyeScore * 0.15),
     1
   );
 
-  // Blended confidence
   const blended = (faceScore * FACE_WEIGHT) + (_audioLaughConfidence * AUDIO_WEIGHT);
-
-  // Two trigger paths:
-  // 1. Blended signal exceeds threshold (normal case)
-  // 2. Face alone is extremely strong (e.g. audio muted)
   const shouldAccumulate = blended >= COMBINED_TRIGGER_THRESHOLD || faceScore >= FACE_SOLO_THRESHOLD;
 
   if (shouldAccumulate) {
@@ -552,7 +567,6 @@ function finishCalibration() {
   const n = calibrationSamples.length;
   if (n === 0) return;
 
-  // Use mean of the middle 60% of samples (trim outliers)
   const trimmed = (arr) => {
     const sorted = [...arr].sort((a, b) => a - b);
     const lo = Math.floor(n * 0.2), hi = Math.ceil(n * 0.8);
@@ -563,7 +577,6 @@ function finishCalibration() {
   baselineMouth = trimmed(calibrationSamples.map(s => s.mouth));
   baselineCheek = trimmed(calibrationSamples.map(s => s.cheek));
   baselineEye   = trimmed(calibrationSamples.map(s => s.eyeApert));
-
   console.log('Calibrated — mouth:', baselineMouth.toFixed(4),
               'cheek:', baselineCheek.toFixed(4),
               'eye:', baselineEye.toFixed(4));
@@ -593,12 +606,45 @@ function handlePlayerLaughed(id) {
   const badge = document.getElementById('laugh-badge-' + id);
   if (badge) badge.classList.add('visible');
 
-  const activePlayers = playerOrder.filter(p => !laughedThisRound.has(p));
-  if (maxPlayers === 2) {
-    endRound();
+  if (gameMode === 'elimination' && !eliminationFinals) {
+    handleEliminationLaugh(id);
   } else {
-    if (activePlayers.length <= 1) endRound();
+    // Standard mode (or elimination finals with 2 players)
+    const remaining = activePlayers.filter(p => !laughedThisRound.has(p));
+    if (activePlayers.length === 2) {
+      // 1v1: first laugh ends the round
+      endRound();
+    } else {
+      // Multi-player standard: all but one laughed
+      if (remaining.length <= 1) endRound();
+    }
   }
+}
+
+function handleEliminationLaugh(id) {
+  // In elimination mode: the player who laughed is out of the tournament
+  // (unless we've already reached finals with 2 players)
+  eliminatePlayer(id);
+
+  const stillActive = activePlayers.length;
+
+  if (stillActive === 1) {
+    // Tournament winner!
+    endEliminationTournament(activePlayers[0]);
+    return;
+  }
+
+  if (stillActive === 2) {
+    // Transition to finals — switch to standard best-of mode
+    eliminationFinals = true;
+    // Reset scores for the 2 finalists
+    activePlayers.forEach(pid => { scores[pid] = 0; });
+    endRoundElimination('finals_transition');
+    return;
+  }
+
+  // Still 3+ active: end this round (no winner scored) and start a new round
+  endRoundElimination('continue');
 }
 
 function endRound() {
@@ -608,13 +654,17 @@ function endRound() {
   stopTimer();
   document.getElementById('laugh-btn').disabled = true;
 
-  const activePlayers = playerOrder.filter(p => !laughedThisRound.has(p));
-  const winnerId = activePlayers.length === 1 ? activePlayers[0] : null;
+  const remaining = activePlayers.filter(p => !laughedThisRound.has(p));
+  const winnerId  = remaining.length === 1 ? remaining[0]
+                  : (activePlayers.length === 2 && laughedThisRound.size >= 1)
+                    ? remaining[0] || null
+                    : null;
+
   if (winnerId) scores[winnerId] = (scores[winnerId] || 0) + 1;
   updateScoreHUD();
 
   const winsNeeded  = Math.ceil(bestOf / 2);
-  const matchWinner = playerOrder.find(id => (scores[id] || 0) >= winsNeeded);
+  const matchWinner = activePlayers.find(id => (scores[id] || 0) >= winsNeeded);
 
   if (matchWinner) {
     playerOrder.forEach(id => { allTimeScores[id] = (allTimeScores[id] || 0) + (scores[id] || 0); });
@@ -624,34 +674,115 @@ function endRound() {
   }
 }
 
+// Elimination mode: end of an elimination sub-round (no score awarded, just reflow)
+function endRoundElimination(reason) {
+  if (!roundActive) return;
+  roundActive = false;
+  laughDetectionActive = false;
+  stopTimer();
+  document.getElementById('laugh-btn').disabled = true;
+
+  if (reason === 'finals_transition') {
+    showEliminationFinalsTransition();
+  } else {
+    // Show who was eliminated then continue
+    showEliminationRoundResult();
+  }
+}
+
+function endEliminationTournament(winnerId) {
+  if (!roundActive) return;
+  roundActive = false;
+  laughDetectionActive = false;
+  stopTimer();
+  document.getElementById('laugh-btn').disabled = true;
+
+  playerOrder.forEach(id => { allTimeScores[id] = (allTimeScores[id] || 0) + (scores[id] || 0); });
+  showGameOver(winnerId);
+}
+
+// ─── Result screens ───────────────────────────────────────
 function showRoundResult(winnerId) {
   const iWon     = winnerId === me();
   const noWinner = winnerId === null;
-  document.getElementById('round-emoji').textContent = noWinner ? '🤝' : iWon ? '🏆' : '😭';
-  document.getElementById('round-title').textContent = noWinner ? 'everyone laughed' : iWon ? 'you held it!' : 'you laughed';
-  document.getElementById('round-title').className   = 'result-title ' + (iWon ? 'win' : noWinner ? '' : 'lose');
-  document.getElementById('round-sub').textContent   = noWinner ? 'no points awarded'
+  const iAmActive = activePlayers.includes(me());
+
+  document.getElementById('round-emoji').textContent = noWinner ? '🤝' : iWon ? '🏆' : (iAmActive ? '😅' : '💀');
+  document.getElementById('round-title').textContent = noWinner ? 'everyone laughed'
+    : iWon ? 'you held it!'
+    : iAmActive ? 'you laughed'
+    : 'you laughed';
+  document.getElementById('round-title').className = 'result-title ' + (iWon ? 'win' : noWinner ? '' : 'lose');
+  document.getElementById('round-sub').textContent = noWinner ? 'no points awarded'
     : iWon ? 'you win the round'
     : winnerId ? 'player ' + (playerOrder.indexOf(winnerId) + 1) + ' wins the round' : '';
+
   document.getElementById('rs-you').textContent  = scores[me()] || 0;
-  document.getElementById('rs-them').textContent = playerOrder.filter(id => id !== me()).map(id => scores[id] || 0).join(' / ');
+  const others = activePlayers.filter(id => id !== me());
+  document.getElementById('rs-them').textContent = others.map(id => scores[id] || 0).join(' / ');
 
   const btn = document.getElementById('next-btn');
   btn.disabled    = false;
-  btn.textContent = 'ready for next round →';
+  btn.textContent = activePlayers.includes(me()) ? 'ready for next round →' : 'watching... →';
+  btn.onclick     = requestNextRound;
+  showScreen('round');
+}
+
+function showEliminationRoundResult() {
+  const justEliminated = eliminatedPlayers[eliminatedPlayers.length - 1];
+  const iWasEliminated = justEliminated === me();
+  const iAmStillIn     = activePlayers.includes(me());
+
+  document.getElementById('round-emoji').textContent = iWasEliminated ? '💀' : iAmStillIn ? '😤' : '👀';
+  document.getElementById('round-title').textContent = iWasEliminated ? 'you laughed!' : 'player out!';
+  document.getElementById('round-title').className   = 'result-title ' + (iWasEliminated ? 'lose' : 'win');
+
+  const elimName = 'player ' + (playerOrder.indexOf(justEliminated) + 1);
+  document.getElementById('round-sub').textContent = iWasEliminated
+    ? 'you\'ve been eliminated — watch the rest'
+    : elimName + ' has been eliminated · ' + activePlayers.length + ' remain';
+
+  document.getElementById('rs-you').textContent  = scores[me()] || 0;
+  const others = activePlayers.filter(id => id !== me());
+  document.getElementById('rs-them').textContent = others.map(id => scores[id] || 0).join(' / ') || '—';
+
+  const btn = document.getElementById('next-btn');
+  btn.disabled    = false;
+  btn.textContent = 'continue →';
+  btn.onclick     = requestNextRound;
+  showScreen('round');
+}
+
+function showEliminationFinalsTransition() {
+  const iAmFinalist = activePlayers.includes(me());
+  const f1 = 'player ' + (playerOrder.indexOf(activePlayers[0]) + 1);
+  const f2 = 'player ' + (playerOrder.indexOf(activePlayers[1]) + 1);
+
+  document.getElementById('round-emoji').textContent = iAmFinalist ? '🥊' : '🍿';
+  document.getElementById('round-title').textContent = iAmFinalist ? 'finals!' : 'finals time!';
+  document.getElementById('round-title').className   = 'result-title win';
+  document.getElementById('round-sub').textContent   = f1 + ' vs ' + f2 + ' · best of ' + bestOf;
+
+  document.getElementById('rs-you').textContent  = 0;
+  document.getElementById('rs-them').textContent = 0;
+
+  const btn = document.getElementById('next-btn');
+  btn.disabled    = false;
+  btn.textContent = iAmFinalist ? 'let\'s go →' : 'watch the finals →';
   btn.onclick     = requestNextRound;
   showScreen('round');
 }
 
 function showGameOver(winnerId) {
   const iWon = winnerId === me();
-  document.getElementById('over-emoji').textContent = iWon ? '🏆' : '😭';
+  document.getElementById('over-emoji').textContent = iWon ? '🏆' : (gameMode === 'elimination' ? '💀' : '😭');
   document.getElementById('over-title').textContent = iWon ? 'you win!' : 'you lose';
   document.getElementById('over-title').className   = 'result-title ' + (iWon ? 'win' : 'lose');
+
   const allTimeMe     = allTimeScores[me()] || 0;
   const allTimeOthers = playerOrder.filter(id => id !== me()).map(id => allTimeScores[id] || 0).join(' / ');
-  document.getElementById('os-you').textContent   = allTimeMe;
-  document.getElementById('os-them').textContent  = allTimeOthers;
+  document.getElementById('os-you').textContent  = allTimeMe;
+  document.getElementById('os-them').textContent = allTimeOthers;
   document.getElementById('over-sub').textContent = 'all time · you ' + allTimeMe + ' vs ' + allTimeOthers;
 
   const btn = document.getElementById('next-btn');
@@ -677,6 +808,11 @@ function requestRematch() {
 }
 
 async function resetGame() {
+  // Full reset — everyone re-enters active grid
+  activePlayers    = [...playerOrder];
+  eliminatedPlayers = [];
+  eliminationFinals = false;
+
   playerOrder.forEach(id => { scores[id] = 0; });
   laughTriggered = false;
   laughedThisRound.clear();
@@ -685,15 +821,7 @@ async function resetGame() {
   for (const id in peers) { peers[id].close(); }
   peers = {};
 
-  playerOrder.filter(id => id !== me()).forEach(id => {
-    const vid = document.getElementById('video-' + id);
-    if (vid) vid.srcObject = null;
-    const ol = document.getElementById('overlay-' + id);
-    if (ol) { ol.style.display = ''; ol.style.opacity = '1'; ol.textContent = '⏳'; }
-    const badge = document.getElementById('laugh-badge-' + id);
-    if (badge) badge.classList.remove('visible');
-  });
-
+  buildCamGrid(playerOrder);
   showScreen('game');
   document.getElementById('timer').classList.remove('danger');
   beginPrepPhase();
@@ -714,6 +842,7 @@ function beginPrepPhase() {
   laughedThisRound.clear();
   document.getElementById('laugh-btn').disabled = true;
 
+  // Clear laugh badges (keep out-badges for eliminated players)
   playerOrder.forEach(id => {
     const badge = document.getElementById('laugh-badge-' + id);
     if (badge) badge.classList.remove('visible');
@@ -724,8 +853,10 @@ function beginPrepPhase() {
   updateTimerDisplay();
   setStatus('', false);
 
-  // Reset calibration for fresh baseline each round
-  if (faceMesh) {
+  // Only active players are in the round — re-check if I'm still active
+  const iAmActive = activePlayers.includes(me());
+
+  if (faceMesh && iAmActive) {
     calibrating        = true;
     calibrationSamples = [];
   }
@@ -766,13 +897,21 @@ function runCountdown(steps, onDone) {
 }
 
 function goRound() {
-  setStatus("😐  don't laugh.", true);
+  const iAmActive = activePlayers.includes(me());
+
+  if (iAmActive) {
+    setStatus("😐  don't laugh.", true);
+  } else {
+    setStatus('👀  watching...', false);
+  }
+
   roundActive          = true;
-  laughDetectionActive = true;
-  laughTriggered       = false;
+  laughDetectionActive = iAmActive;   // spectators don't trigger detection
+  laughTriggered       = !iAmActive;  // treat spectators as already "done"
   laughStartTime       = null;
   calibrating          = false;
-  if (!faceMesh) document.getElementById('laugh-btn').disabled = false;
+
+  if (!faceMesh && iAmActive) document.getElementById('laugh-btn').disabled = false;
   startTimer();
 }
 
@@ -804,7 +943,8 @@ function iLaughed() {
 
 function updateScoreHUD() {
   document.getElementById('score-you').textContent  = scores[me()] || 0;
-  document.getElementById('score-them').textContent = playerOrder.filter(id => id !== me()).map(id => scores[id] || 0).join('/');
+  const others = (eliminationFinals ? activePlayers : playerOrder).filter(id => id !== me());
+  document.getElementById('score-them').textContent = others.map(id => scores[id] || 0).join('/');
 }
 
 // ─── Lobby selectors ──────────────────────────────────────
@@ -822,6 +962,24 @@ function setMaxPlayers(n) {
     const btn = document.getElementById('mp-' + v);
     if (btn) btn.className = 'btn' + (v === n ? ' primary' : '');
   });
+  // Show/hide game mode selector — elimination only makes sense for 3+
+  const modeRow = document.getElementById('mode-row');
+  if (modeRow) modeRow.style.display = n >= 3 ? '' : 'none';
+  if (n < 3) setGameMode('standard');
+}
+
+function setGameMode(mode) {
+  selectedGameMode = mode;
+  ['standard', 'elimination'].forEach(m => {
+    const btn = document.getElementById('gm-' + m);
+    if (btn) btn.className = 'btn' + (m === mode ? ' primary' : '');
+  });
+  const desc = document.getElementById('mode-desc');
+  if (desc) {
+    desc.textContent = mode === 'elimination'
+      ? 'laugh = you\'re out · last one standing wins'
+      : 'first to laugh loses the round · best of ' + selectedBestOf;
+  }
 }
 
 // ─── Helpers ──────────────────────────────────────────────
@@ -849,7 +1007,12 @@ function hideOverlay(id) {
 function createRoom() {
   document.getElementById('lobby-error').textContent = '';
   const code = Math.random().toString(36).substring(2, 6).toUpperCase();
-  socket.emit('create_room', { code, bestOf: selectedBestOf, maxPlayers: selectedMaxPlayers });
+  socket.emit('create_room', {
+    code,
+    bestOf: selectedBestOf,
+    maxPlayers: selectedMaxPlayers,
+    gameMode: selectedGameMode,
+  });
 }
 
 function joinRoom() {
@@ -859,7 +1022,7 @@ function joinRoom() {
   socket.emit('join_room', code);
 }
 
-function goLobby()  { cleanup(); showScreen('lobby'); }
+function goLobby()   { cleanup(); showScreen('lobby'); }
 function leaveGame() { if (confirm('Leave the game?')) goLobby(); }
 
 function cleanup() {
@@ -871,12 +1034,15 @@ function cleanup() {
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   for (const id in peers) { peers[id].close(); }
-  peers = {};
+  peers             = {};
   if (faceMesh) { faceMesh.close(); faceMesh = null; }
-  roomCode    = null;
-  playerOrder = [];
-  scores      = {};
-  allTimeScores = {};
+  roomCode          = null;
+  playerOrder       = [];
+  activePlayers     = [];
+  eliminatedPlayers = [];
+  eliminationFinals = false;
+  scores            = {};
+  allTimeScores     = {};
   laughedThisRound.clear();
   document.getElementById('join-code').value = '';
   document.getElementById('timer').classList.remove('danger');

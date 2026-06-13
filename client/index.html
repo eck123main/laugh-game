@@ -40,6 +40,18 @@
       </div>
     </div>
 
+    <!-- Mode selector: only visible for 3+ players -->
+    <div class="lobby-option-row" id="mode-row" style="display:none;">
+      <span class="lobby-option-label">mode</span>
+      <div class="btn-group">
+        <button class="btn" id="gm-standard" onclick="setGameMode('standard')">standard</button>
+        <button class="btn" id="gm-elimination" onclick="setGameMode('elimination')">elimination</button>
+      </div>
+    </div>
+
+    <!-- Mode description -->
+    <div class="mode-desc" id="mode-desc" style="display:none;">laugh = you're out · last one standing wins</div>
+
     <button class="btn primary" onclick="createRoom()" style="margin-top:4px;">create room</button>
     <div class="divider"></div>
     <div class="input-row">
@@ -75,7 +87,7 @@
     </div>
   </div>
 
-  <!-- Camera grid — populated dynamically -->
+  <!-- Camera grid — populated dynamically by buildCamGrid() -->
   <div class="cams players-2" id="cams"></div>
 
   <div class="game-bottom">

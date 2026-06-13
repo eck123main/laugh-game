@@ -14,11 +14,12 @@ const rooms = {};
 io.on('connection', (socket) => {
   console.log('connected:', socket.id);
 
-  socket.on('create_room', ({ code, bestOf, maxPlayers }) => {
+  socket.on('create_room', ({ code, bestOf, maxPlayers, gameMode }) => {
     rooms[code] = {
       players: [socket.id],
       maxPlayers: maxPlayers || 2,
       bestOf: bestOf || 5,
+      gameMode: gameMode || 'standard',   // 'standard' | 'elimination'
       rematchVotes: new Set(),
       nextRoundVotes: new Set(),
     };
@@ -44,7 +45,8 @@ io.on('connection', (socket) => {
         io.to(code).emit('game_start', {
           bestOf: room.bestOf,
           players: room.players,
-          maxPlayers: room.maxPlayers
+          maxPlayers: room.maxPlayers,
+          gameMode: room.gameMode,
         });
       }, 500);
     }
@@ -56,12 +58,10 @@ io.on('connection', (socket) => {
 
     if (type === 'next_round_ready') {
       room.nextRoundVotes.add(socket.id);
-      // Tell everyone the current vote count so they can show progress
       io.to(code).emit('game_event', {
         type: 'next_round_vote_update',
         data: { votes: room.nextRoundVotes.size, needed: room.players.length }
       });
-      // When everyone has voted, fire begin_round for all
       if (room.nextRoundVotes.size >= room.players.length) {
         room.nextRoundVotes.clear();
         io.to(code).emit('game_event', { type: 'begin_round' });
@@ -80,10 +80,8 @@ io.on('connection', (socket) => {
       }
 
     } else if (data && data.targetId) {
-      // Targeted WebRTC signalling
       io.to(data.targetId).emit('game_event', { type, data, fromId: socket.id });
     } else {
-      // Broadcast to everyone else
       socket.to(code).emit('game_event', { type, data, fromId: socket.id });
     }
   });
