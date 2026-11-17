@@ -62,7 +62,7 @@ let allTimeScores = {};
 let laughedThisRound     = new Set();
 let roundActive          = false;
 let audioCtx             = null;
-let scriptProcessor      = null;   // kept so we can disconnect on cleanup
+let micCaptureNode       = null;   // AudioWorkletNode or ScriptProcessor; disconnected on cleanup
 
 let faceMesh             = null;
 let laughDetectionActive = false;
@@ -104,6 +104,7 @@ const INFER_EVERY_FRAMES  = 4;      // 4 × 186 samples ≈ 93 ms between infere
 const AUDIO_RMS_GATE      = 0.008;  // below this the window is treated as silence
 const FACE_LOST_MS        = 600;    // after this long without a face, audio decides alone
 const ONNX_MODEL_PATH     = '/models/laughter_resnet.onnx';
+const MIC_WORKLET_PATH    = '/mic-worklet.js';
 
 // ─── Load ONNX model ──────────────────────────────────────
 // Features + model notes live in laugh-audio.js. The shipped model declares
@@ -418,19 +419,15 @@ async function initAudioDetection() {
     if (audioCtx.state === 'suspended') audioCtx.resume();
 
     if (modelLoaded) {
-      // ── ResNet path: ScriptProcessor → resampler → log-mel stream → model ──
+      // ── ResNet path: mic capture → resampler → log-mel stream → model ──
       audioResampler = new LaughAudio.Resampler(audioCtx.sampleRate, ONNX_SAMPLE_RATE);
       laughStream.reset();
       probSmoother.reset();
       framesSinceInference = 0;
 
-      scriptProcessor = audioCtx.createScriptProcessor(1024, 1, 1);
-      source.connect(scriptProcessor);
-      scriptProcessor.connect(audioCtx.destination);   // output stays silent
-
-      scriptProcessor.onaudioprocess = (e) => {
+      const onMicSamples = (chunk) => {
         if (!audioCtx || !laughStream) return;
-        const samples = audioResampler.process(e.inputBuffer.getChannelData(0));
+        const samples = audioResampler.process(chunk);
         framesSinceInference += laughStream.push(samples);
 
         if (framesSinceInference < INFER_EVERY_FRAMES || inferenceBusy) return;
@@ -457,7 +454,34 @@ async function initAudioDetection() {
         });
       };
 
-      console.log('Audio detection: ResNet ONNX mode');
+      // Prefer an AudioWorklet (audio thread, no dropped buffers when the
+      // main thread is busy with FaceMesh); fall back to ScriptProcessor.
+      const ctx = audioCtx;
+      let captureMode = 'ScriptProcessor';
+      if (ctx.audioWorklet && typeof AudioWorkletNode !== 'undefined') {
+        try {
+          await ctx.audioWorklet.addModule(MIC_WORKLET_PATH);
+          if (audioCtx !== ctx) return;          // cleaned up while loading
+          const node = new AudioWorkletNode(ctx, 'mic-capture', {
+            numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1, channelCountMode: 'explicit',
+          });
+          node.port.onmessage = (e) => onMicSamples(e.data);
+          source.connect(node);
+          micCaptureNode = node;
+          captureMode = 'AudioWorklet';
+        } catch (e) {
+          console.warn('AudioWorklet unavailable, using ScriptProcessor:', e);
+        }
+      }
+      if (!micCaptureNode) {
+        const sp = ctx.createScriptProcessor(1024, 1, 1);
+        source.connect(sp);
+        sp.connect(ctx.destination);   // output stays silent
+        sp.onaudioprocess = (e) => onMicSamples(e.inputBuffer.getChannelData(0));
+        micCaptureNode = sp;
+      }
+
+      console.log('Audio detection: ResNet ONNX mode (' + captureMode + ')');
     } else {
       // ── Heuristic fallback (original code) ────────────────
       const analyser = audioCtx.createAnalyser();
@@ -1077,9 +1101,12 @@ function cleanup() {
   if (laughStream)  laughStream.reset();
   if (probSmoother) probSmoother.reset();
 
-  if (scriptProcessor) {
-    try { scriptProcessor.disconnect(); } catch (_) {}
-    scriptProcessor = null;
+  if (micCaptureNode) {
+    try {
+      if (micCaptureNode.port) micCaptureNode.port.onmessage = null;
+      micCaptureNode.disconnect();
+    } catch (_) {}
+    micCaptureNode = null;
   }
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }

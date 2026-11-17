@@ -7,7 +7,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
-for (const file of ['game.js', 'laugh-audio.js', 'laugh-face.js']) {
+for (const file of ['game.js', 'laugh-audio.js', 'laugh-face.js', 'mic-worklet.js']) {
   test(`client/${file} parses`, () => {
     const src = fs.readFileSync(path.join(__dirname, '..', 'client', file), 'utf8');
     assert.doesNotThrow(() => new vm.Script(src, { filename: file }));
