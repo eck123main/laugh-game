@@ -390,3 +390,80 @@ The working tree was clean; round 3 had finished and committed everything.
   different in laughter, and it could down-weight talking.
 - Still open: MediaPipe Face Landmarker blendshapes; YAMNet as a second
   audio opinion.
+
+## Round 5 — 2026-11-18 (prompt: "round 4 of tonight")
+
+### Starting state
+The working tree was clean and round 4 had committed everything.
+
+### ⚠️ Tests were written but NOT run
+In this session every `node`/`npm` command was denied automatically (no
+approval surface), so I could not run the suite. I checked the new tests by
+hand-computing the expected values, but **please run `npm test` first**.
+If `tests/burst-rhythm.test.js` fails, the most likely culprit is the
+"irregular bursts" test. It uses a synthetic signal, and its margin (0.2)
+was estimated, not measured.
+
+### What changed and why
+1. **Burst-rhythm cue** (`BurstRhythm` in `client/laugh-audio.js`, wired in
+   `game.js`, commit `bbd6883`).
+   - Earlier rounds listed a speech-vs-laugh audio cue as the top open idea.
+     Laughter is a train of near-identical calls at ~4.4 calls/s
+     (Bachorowski et al. 2001), which is a period of ~230 ms. Speech
+     syllables vary in length and loudness. Coughs and slams are a single
+     burst, and fans are flat.
+   - The ResNet sees 256 ms FFT frames, too coarse to resolve 100 ms calls,
+     so this cue is independent information.
+   - How it works:
+     - It builds a 10 ms dB energy envelope over the last 1.5 s, with the
+       floor clipped 30 dB below the peak.
+     - It takes the normalised autocorrelation at lags 120–400 ms.
+     - A lag only counts if it is a local maximum and the envelope
+       decorrelated (r < 0) at a shorter lag. Otherwise one long burst or a
+       held vowel would look "periodic" at short lags.
+     - A sound with under 1 dB of envelope variation counts as steady noise
+       and scores 0.
+   - The model probability is multiplied by `0.9 + 0.1·min(r/0.45, 1)`
+     before smoothing. The cue is deliberately bounded: it can cost a
+     non-rhythmic sound at most 10%, so it trims borderline false positives
+     without vetoing a real laugh.
+   - `localStorage.ogiggleNoRhythm = 1` turns it off for A/B testing. The
+     debug log prints `rhythm:`.
+2. **Eval harness**: it applies the same scaling, has a `--no-rhythm` flag,
+   and prints each file's median regularity. Recordings will show whether
+   laughs and speech actually separate on this cue, and how far `minScale`
+   and `full` can be pushed.
+3. Tests: `tests/burst-rhythm.test.js` (regular vs irregular bursts, steady
+   noise, single cough, reset) and an eval test showing that a borderline
+   0.8 score on a flat tone no longer fires.
+4. README: a pipeline-table row and a note on the A/B flag.
+
+### Research
+- Truong & van Leeuwen 2007, "Automatic discrimination between laughter and
+  speech": laughter differs from speech in mean pitch and in the ratio of
+  unvoiced to voiced durations, and combining prosodic and spectral features
+  helps. https://data.zhenzhi.com/details/1/907008030
+- Slaney (Microsoft Research), "Characteristic contours of syllabic-level
+  units in laughter": the shape of the intensity envelope at the syllable
+  level is a key cue. https://www.microsoft.com/en-us/research/?p=165315
+- Ludusan & Wagner, Speech Prosody 2024: rhythm is the one prosodic
+  dimension that does not differ between laughter types, so it is a stable
+  laughter cue.
+  https://www.isca-archive.org/speechprosody_2024/ludusan24_speechprosody.html
+- Bachorowski, Smoski & Owren 2001, "The acoustic features of human
+  laughter" (JASA): 1024 bouts. The rate of ~4.37 calls/s is cited via
+  https://www.osu.tests.sfulib4.publicknowledgeproject.org/index.php/EMR/article/view/5608/5176 ;
+  abstract at https://scholars.duke.edu/publication/706959
+- Oh et al., Interspeech 2013:
+  https://www.isca-archive.org/interspeech_2013/oh13_interspeech.html
+
+### Ideas for next time
+- Run `npm test`. Then run `node scripts/eval-audio.js clips` with and
+  without `--no-rhythm`. If laughs and speech separate well on median
+  regularity, lower `minScale` (e.g. to 0.75) and fit `full`.
+- Unvoiced/voiced duration ratio (Truong 2007): a per-10 ms voicing flag
+  from zero-crossing rate or spectral flatness, added to `BurstRhythm`.
+- Pitch cue: laughter has a higher and wider f0. A cheap autocorrelation
+  pitch tracker on the 8 kHz stream would provide it.
+- Still open: the face replay harness, the audio–visual correlation cue,
+  MediaPipe blendshapes, and YAMNet.
