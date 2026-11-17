@@ -39,6 +39,39 @@ test('aspect correction: features match regardless of image aspect', () => {
   for (const k of ['mouth', 'width', 'eye']) assert.ok(Math.abs(a[k] - b[k]) < 1e-6, k);
 });
 
+// Rotate a synthetic face about the vertical axis (yaw), keeping depth in z
+// like FaceMesh does (z on the same scale as x).
+function yawed(lm, deg, aspect = 4 / 3, cx = 0.5) {
+  const c = Math.cos(deg * Math.PI / 180), s = Math.sin(deg * Math.PI / 180);
+  return lm.map((p) => {
+    const x = (p.x - cx) * aspect, z = (p.z || 0) * aspect;
+    return { x: cx + (x * c - z * s) / aspect, y: p.y, z: (x * s + z * c) / aspect };
+  });
+}
+
+test('features are invariant to head yaw (3D distances)', () => {
+  const o = { open: 0.05, widen: 1.15, eye: 0.8 };
+  const front = LF.getFaceFeatures(face(o));
+  for (const deg of [20, 40]) {
+    const turned = LF.getFaceFeatures(yawed(face(o), deg));
+    for (const k of ['mouth', 'width', 'lift', 'eye']) {
+      assert.ok(Math.abs(front[k] - turned[k]) < 1e-6, `${deg}° ${k}: ${front[k]} vs ${turned[k]}`);
+    }
+  }
+});
+
+test('turning the head does not raise the laugh score', () => {
+  const base = neutralBase();
+  const turned = LF.scoreFace(LF.getFaceFeatures(yawed(face({}), 35)), base);
+  assert.ok(turned.score < 0.05, `score ${turned.score}`);
+});
+
+test('landmarks without z fall back to 2D distances', () => {
+  const lm = face({ open: 0.05 }).map(({ x, y }) => ({ x, y }));
+  const f = LF.getFaceFeatures(lm);
+  assert.ok(f && Number.isFinite(f.mouth) && Number.isFinite(f.eye));
+});
+
 test('degenerate landmarks return null and score 0', () => {
   const lm = Array.from({ length: 478 }, () => ({ x: 0.5, y: 0.5, z: 0 }));
   assert.equal(LF.getFaceFeatures(lm), null);

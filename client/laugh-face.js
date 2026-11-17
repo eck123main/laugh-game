@@ -37,8 +37,14 @@
 
   // `aspect` = image width / height. FaceMesh x and y are normalised to the
   // image width and height separately, so x must be rescaled before mixing.
+  // z (depth) uses roughly the same scale as x, so it gets the same factor.
+  // Distances are measured in 3D: a 2D inter-ocular distance shrinks by
+  // cos(yaw) when the player turns their head, which inflated every
+  // IOD-normalised cue (and the mouth height/width ratio) by up to ~30 %.
+  // 3D distances between landmarks are (nearly) invariant to head rotation.
+  // Landmarks without z (older models, tests) fall back to 2D.
   function getFaceFeatures(lm, aspect = 4 / 3) {
-    const dist = (a, b) => Math.hypot((a.x - b.x) * aspect, a.y - b.y);
+    const dist = (a, b) => Math.hypot((a.x - b.x) * aspect, a.y - b.y, ((a.z || 0) - (b.z || 0)) * aspect);
     const iod = dist(lm[LM.EYE_OUTER_L], lm[LM.EYE_OUTER_R]);
     if (!(iod > 1e-4)) return null;
 
