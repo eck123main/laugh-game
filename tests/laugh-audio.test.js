@@ -118,6 +118,28 @@ test('dB reference never sinks to the noise floor after a long quiet stretch', (
   assert.equal(s.sessionPeak, 0);
 });
 
+test('peakRms sees a short soft burst that the window mean dilutes', () => {
+  const s = new LA.LogMelStream();
+  s.push(new Float32Array(LA.SR));              // 1 s silence
+  s.push(tone(400, 0.25, LA.SR, 0.02));         // 250 ms soft "ha" (rms ≈ 0.014)
+  s.push(new Float32Array(LA.HOP * 2));
+  assert.ok(s.ready());
+  assert.ok(s.rms() < 0.008, `mean rms ${s.rms()} would gate the burst out`);
+  assert.ok(s.peakRms() > 0.008, `peak rms ${s.peakRms()} keeps it`);
+  assert.ok(s.peakRms() < 0.02);
+});
+
+test('getWindow reuses its output buffer unless one is passed', () => {
+  const s = new LA.LogMelStream();
+  s.push(tone(700, 1.5));
+  const a = s.getWindow();
+  const b = s.getWindow();
+  assert.equal(a, b, 'same buffer returned');
+  const mine = new Float32Array(LA.N_FRAMES * LA.N_MELS);
+  assert.equal(s.getWindow(mine), mine);
+  assert.deepEqual(Array.from(mine), Array.from(a));
+});
+
 test('reset clears the stream', () => {
   const s = new LA.LogMelStream();
   s.push(tone(700, 1.5));

@@ -101,7 +101,7 @@ let lastFaceSeenAt = 0;      // ms timestamp of the last frame with a face
 
 const ONNX_SAMPLE_RATE    = 8000;
 const INFER_EVERY_FRAMES  = 4;      // 4 × 186 samples ≈ 93 ms between inferences
-const AUDIO_RMS_GATE      = 0.008;  // below this the window is treated as silence
+const AUDIO_RMS_GATE      = 0.008;  // loudest ~256 ms frame below this → window is silence
 const FACE_LOST_MS        = 600;    // after this long without a face, audio decides alone
 const ONNX_MODEL_PATH     = '/models/laughter_resnet.onnx';
 const MIC_WORKLET_PATH    = '/mic-worklet.js';
@@ -478,7 +478,7 @@ async function initAudioDetection() {
           return;
         }
         if (!laughStream.ready()) return;
-        if (laughStream.rms() < AUDIO_RMS_GATE) {
+        if (laughStream.peakRms() < AUDIO_RMS_GATE) {
           _audioLaughConfidence = probSmoother.decay();
           updateAudioTrigger();
           return;

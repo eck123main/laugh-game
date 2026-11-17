@@ -213,9 +213,22 @@
       return Math.sqrt(s / n);
     }
 
+    // RMS of the loudest frame (N_FFT samples ≈ 256 ms) in the current window.
+    // Use this for silence gating: a short soft "ha" in an otherwise quiet
+    // 1.26 s window is diluted ~5× by the mean (rms()) and was gated out.
+    peakRms() {
+      const n = Math.min(this.nFrames, N_FRAMES);
+      let mx = 0;
+      for (let i = 0; i < n; i++) if (this.frameEnergy[i] > mx) mx = this.frameEnergy[i];
+      return Math.sqrt(mx);
+    }
+
+    // Pass `out` (or let the stream reuse its own buffer) to avoid allocating
+    // a 22 KB array every inference. The returned array is overwritten by the
+    // next call, so consume (or copy) it before then.
     getWindow(out) {
       if (!this.ready()) return null;
-      out = out || new Float32Array(N_FRAMES * N_MELS);
+      out = out || this._windowBuf || (this._windowBuf = new Float32Array(N_FRAMES * N_MELS));
       let winMax = 0;
       for (let i = 0; i < N_FRAMES; i++) if (this.frameMax[i] > winMax) winMax = this.frameMax[i];
       const ref = Math.max(winMax, this.peak);
