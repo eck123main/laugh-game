@@ -338,6 +338,35 @@
     progress() { return Math.min(this.evidence / this.sustainMs, 1); }
   }
 
+  // ── Far-end (opponent audio) activity guard ───────────────────────────────
+  // In this game the opponents are *trying* to make you laugh, and their
+  // laughter plays through your speakers. Echo cancellation removes most of
+  // it, but not all (loud speakers, laptop mics, double-talk). While remote
+  // audio is active the local audio evidence is less trustworthy, so callers
+  // raise the audio-only threshold / down-weight audio in the fusion.
+  // Activity is "RMS ≥ rmsOn", held for holdMs after the last loud update so
+  // the echo tail (room reverb + AEC convergence) is covered too.
+  class FarEndGuard {
+    constructor({ rmsOn = 0.02, holdMs = 700 } = {}) {
+      Object.assign(this, { rmsOn, holdMs });
+      this.reset();
+    }
+    reset() { this.lastActiveAt = -Infinity; this.level = 0; }
+    update(rms, nowMs) {
+      this.level = rms;
+      if (rms >= this.rmsOn) this.lastActiveAt = nowMs;
+      return this.active(nowMs);
+    }
+    active(nowMs) { return nowMs - this.lastActiveAt <= this.holdMs; }
+  }
+
+  // Root-mean-square of a Float32Array.
+  function rmsOf(x) {
+    let s = 0;
+    for (let i = 0; i < x.length; i++) s += x[i] * x[i];
+    return x.length ? Math.sqrt(s / x.length) : 0;
+  }
+
   // ── ONNX model input-shape patch ───────────────────────────────────────────
   // The shipped ONNX declares input "input" as [1, 1, 128, "time"], i.e.
   // mel × time, but the Gillick weights were trained on time × mel
@@ -370,7 +399,7 @@
   const api = {
     SR, N_FFT, HOP, N_MELS, N_FRAMES, WINDOW_SAMPLES, PEAK_FLOOR_DB,
     hzToMelSlaney, melToHzSlaney, melFilterbank, hannPeriodic, makeFft,
-    LogMelStream, powerToDb, Resampler, ProbSmoother, LaughGate, patchOnnxInputShape,
+    LogMelStream, powerToDb, Resampler, ProbSmoother, LaughGate, FarEndGuard, rmsOf, patchOnnxInputShape,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.LaughAudio = api;

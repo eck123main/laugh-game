@@ -222,6 +222,23 @@ test('LaughGate validates thresholds', () => {
   assert.throws(() => new LA.LaughGate({ on: 0.5, off: 0.8 }));
 });
 
+test('FarEndGuard is active while remote audio is loud, plus a hold time', () => {
+  const g = new LA.FarEndGuard({ rmsOn: 0.02, holdMs: 700 });
+  assert.equal(g.active(0), false, 'inactive before any audio');
+  assert.equal(g.update(0.005, 0), false, 'quiet remote audio');
+  assert.equal(g.update(0.05, 100), true, 'loud remote audio');
+  assert.equal(g.update(0.0, 500), true, 'held through the echo tail');
+  assert.equal(g.update(0.0, 801), false, 'released after holdMs');
+  g.update(0.05, 900);
+  g.reset();
+  assert.equal(g.active(900), false);
+});
+
+test('rmsOf', () => {
+  close(LA.rmsOf(Float32Array.from([3, -4, 3, -4])), Math.sqrt(12.5), 1e-6);
+  assert.equal(LA.rmsOf(new Float32Array(0)), 0);
+});
+
 test('patchOnnxInputShape rewrites the fixed 128 dim to a symbolic dim', () => {
   const head = [1, 2, 3];
   const sig = [0x0a, 0x05, 0x69, 0x6e, 0x70, 0x75, 0x74, 0x12, 0x1b, 0x0a, 0x19, 0x08, 0x01,

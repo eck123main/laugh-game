@@ -105,6 +105,44 @@ const AUDIO_RMS_GATE      = 0.008;  // below this the window is treated as silen
 const FACE_LOST_MS        = 600;    // after this long without a face, audio decides alone
 const ONNX_MODEL_PATH     = '/models/laughter_resnet.onnx';
 const MIC_WORKLET_PATH    = '/mic-worklet.js';
+// While opponents' audio is playing (see FarEndGuard), local audio may be
+// their laugh leaking past echo cancellation: demand more from audio alone
+// and lean on the face in the fusion.
+const AUDIO_SOLO_THRESHOLD_FAR_END = 0.92;
+const FAR_END_AUDIO_SCALE          = 0.6;
+const farEndGuard  = new LaughAudio.FarEndGuard();
+const farEndMeters = new Map();   // remote MediaStream → AnalyserNode (or null if unsupported)
+let   farEndBuf    = null;
+
+// Meter the loudest remote player's audio and update the far-end guard.
+function updateFarEnd() {
+  const now = Date.now();
+  if (!audioCtx) return farEndGuard.update(0, now);
+  let level = 0;
+  for (const id of playerOrder) {
+    if (id === me()) continue;
+    const vid = document.getElementById('video-' + id);
+    const stream = vid && vid.srcObject;
+    if (!stream || !stream.getAudioTracks().some(t => t.enabled && t.readyState === 'live')) continue;
+    let an = farEndMeters.get(stream);
+    if (an === undefined) {
+      try {
+        an = audioCtx.createAnalyser();
+        an.fftSize = 1024;
+        audioCtx.createMediaStreamSource(stream).connect(an);
+      } catch (e) {
+        console.warn('Cannot meter remote audio:', e);
+        an = null;
+      }
+      farEndMeters.set(stream, an);
+    }
+    if (!an) continue;
+    if (!farEndBuf || farEndBuf.length !== an.fftSize) farEndBuf = new Float32Array(an.fftSize);
+    an.getFloatTimeDomainData(farEndBuf);
+    level = Math.max(level, LaughAudio.rmsOf(farEndBuf));
+  }
+  return farEndGuard.update(level, now);
+}
 
 // ─── Load ONNX model ──────────────────────────────────────
 // Features + model notes live in laugh-audio.js. The shipped model declares
@@ -432,6 +470,7 @@ async function initAudioDetection() {
 
         if (framesSinceInference < INFER_EVERY_FRAMES || inferenceBusy) return;
         framesSinceInference = 0;
+        updateFarEnd();
 
         if (!laughDetectionActive || laughTriggered) {
           _audioLaughConfidence = 0;
@@ -504,7 +543,9 @@ function updateAudioTrigger() {
   // (Only the neural model is trusted alone; the heuristic is too speech-prone.)
   if (faceMesh && (!onnxReady || Date.now() - lastFaceSeenAt < FACE_LOST_MS)) return;
 
-  if (laughGate.update(_audioLaughConfidence / AUDIO_SOLO_THRESHOLD, Date.now())) triggerLaugh();
+  const now = Date.now();
+  const threshold = farEndGuard.active(now) ? AUDIO_SOLO_THRESHOLD_FAR_END : AUDIO_SOLO_THRESHOLD;
+  if (laughGate.update(_audioLaughConfidence / threshold, now)) triggerLaugh();
 }
 
 // Original heuristic audio loop (unchanged, used as fallback)
@@ -666,7 +707,9 @@ function onFaceResults(results) {
   // threshold — so a face-only trigger needs smile/eye cues too.
   const face      = LaughFace.scoreFace(features, faceBaseline);
   const faceScore = face.score;
-  const blended   = (faceScore * FACE_WEIGHT) + (_audioLaughConfidence * AUDIO_WEIGHT);
+  const farEnd    = farEndGuard.active(Date.now());
+  const audioConf = _audioLaughConfidence * (farEnd ? FAR_END_AUDIO_SCALE : 1);
+  const blended   = (faceScore * FACE_WEIGHT) + (audioConf * AUDIO_WEIGHT);
 
   if (DEBUG_LAUGH && Date.now() - lastDebugLogAt > 250) {
     lastDebugLogAt = Date.now();
@@ -677,7 +720,8 @@ function onFaceResults(results) {
       '| open:', face.open.toFixed(2),
       '| smile:', face.smile.toFixed(2),
       '| eye:', face.eye.toFixed(2),
-      '| gate:', laughGate.progress().toFixed(2)
+      '| gate:', laughGate.progress().toFixed(2),
+      '| farEnd:', farEnd ? farEndGuard.level.toFixed(3) : 'off'
     );
   }
 
@@ -1108,6 +1152,8 @@ function cleanup() {
     } catch (_) {}
     micCaptureNode = null;
   }
+  farEndMeters.clear();
+  farEndGuard.reset();
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   for (const id in peers) { peers[id].close(); }
