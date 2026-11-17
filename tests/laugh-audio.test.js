@@ -90,14 +90,32 @@ test('LogMelStream window is time-major and chronologically ordered', () => {
   const silence = new Float32Array(LA.SR); // 1 s silence then a loud tone
   s.push(silence);
   s.push(tone(500, 1.5));
-  s.push(new Float32Array(LA.HOP * 10)); // 10 frames of silence at the end
+  // 20 hops (3720 samples) > N_FFT, so the newest frames contain no tone at
+  // all (a frame that still holds a truncated tone tail leaks broadband).
+  s.push(new Float32Array(LA.HOP * 20));
   const w = s.getWindow();
-  const frameMean = (t) => {
-    let a = 0;
-    for (let m = 0; m < LA.N_MELS; m++) a += w[t * LA.N_MELS + m];
-    return a / LA.N_MELS;
+  const framePeak = (t) => {
+    let a = -Infinity;
+    for (let m = 0; m < LA.N_MELS; m++) a = Math.max(a, w[t * LA.N_MELS + m]);
+    return a;
   };
-  assert.ok(frameMean(LA.N_FRAMES - 1) < frameMean(10) - 10, 'last frames (silence) quieter than earlier tone frames');
+  assert.ok(framePeak(LA.N_FRAMES - 1) < framePeak(10) - 10, 'last frames (silence) quieter than earlier tone frames');
+  close(framePeak(10), 0, 1, 'tone frame holds the window max');
+});
+
+test('dB reference never sinks to the noise floor after a long quiet stretch', () => {
+  const s = new LA.LogMelStream();
+  s.push(tone(1000, 1.5, LA.SR, 0.3));      // loud event sets the session peak
+  s.push(tone(1000, 25, LA.SR, 0.003));     // 25 s of quiet (-40 dB amplitude)
+  const w = s.getWindow();
+  let mx = -Infinity;
+  for (const v of w) mx = Math.max(mx, v);
+  // Quiet tone is -80 units below the peak; reference is floored 60 below,
+  // so the quiet window must stay clearly below 0 dB instead of being
+  // renormalised up to look like a loud sound.
+  close(mx, -(80 - LA.PEAK_FLOOR_DB), 2, 'quiet window max dB');
+  s.reset();
+  assert.equal(s.sessionPeak, 0);
 });
 
 test('reset clears the stream', () => {
@@ -143,6 +161,65 @@ test('ProbSmoother EMA', () => {
   assert.equal(p.decay(), 0.25);
   p.reset();
   assert.equal(p.update(0.2), 0.2);
+});
+
+// Feed a score pattern to a gate at a fixed step; returns time (ms) of the
+// first trigger, or null if it never fires.
+function runGate(gate, pattern, stepMs = 50) {
+  for (let i = 0; i < pattern.length; i++) {
+    if (gate.update(pattern[i], i * stepMs)) return i * stepMs;
+  }
+  return null;
+}
+const repeat = (arr, n) => Array.from({ length: n }, () => arr).flat();
+
+test('LaughGate fires after sustained score above threshold', () => {
+  const g = new LA.LaughGate({ sustainMs: 850 });
+  assert.equal(runGate(g, new Array(17).fill(1.2)), null, '800 ms is not enough');
+  g.reset();
+  assert.equal(runGate(g, new Array(40).fill(1.2)), 850);
+});
+
+test('LaughGate never fires on silence or sub-threshold scores', () => {
+  const g = new LA.LaughGate();
+  assert.equal(runGate(g, new Array(200).fill(0.9)), null);
+  assert.equal(g.evidence, 0, 'hysteresis band does not hold when nothing accumulated');
+});
+
+test('LaughGate tolerates the dips of bursty laughter', () => {
+  // "ha – ha – ha": 300 ms on, 150 ms off (score drops to 0.3).
+  const burst = [...new Array(6).fill(1.2), ...new Array(3).fill(0.3)];
+  const g = new LA.LaughGate({ sustainMs: 850 });
+  const t = runGate(g, repeat(burst, 10));
+  assert.ok(t !== null && t < 2000, `bursty laugh should trigger within 2 s, got ${t}`);
+});
+
+test('LaughGate rejects short sparse spikes (speech-like)', () => {
+  // 100 ms spikes every 600 ms.
+  const spike = [1.2, 1.2, ...new Array(10).fill(0.2)];
+  const g = new LA.LaughGate({ sustainMs: 850 });
+  assert.equal(runGate(g, repeat(spike, 30)), null);
+});
+
+test('LaughGate hysteresis band holds evidence', () => {
+  const g = new LA.LaughGate({ sustainMs: 10000 });
+  runGate(g, new Array(11).fill(1.2));       // 500 ms of evidence
+  const before = g.evidence;
+  for (let i = 0; i < 10; i++) g.update(0.9, 550 + i * 50);
+  assert.equal(g.evidence, before, 'score in [off, on) neither adds nor removes evidence');
+  g.update(0.1, 1100);
+  assert.ok(g.evidence < before, 'below off threshold decays');
+});
+
+test('LaughGate caps dt so a stalled tab cannot fake a sustained laugh', () => {
+  const g = new LA.LaughGate({ sustainMs: 850, maxDtMs: 250 });
+  assert.equal(g.update(1.2, 0), false);
+  assert.equal(g.update(1.2, 5000), false, 'one 5 s gap counts as at most 250 ms');
+  assert.ok(Math.abs(g.progress() - 250 / 850) < 1e-9);
+});
+
+test('LaughGate validates thresholds', () => {
+  assert.throws(() => new LA.LaughGate({ on: 0.5, off: 0.8 }));
 });
 
 test('patchOnnxInputShape rewrites the fixed 128 dim to a symbolic dim', () => {

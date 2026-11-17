@@ -66,8 +66,15 @@ let scriptProcessor      = null;   // kept so we can disconnect on cleanup
 
 let faceMesh             = null;
 let laughDetectionActive = false;
-let laughStartTime       = null;
 let laughTriggered       = false;
+// Hysteresis + leaky-evidence trigger (see LaughGate in laugh-audio.js).
+// Scores fed to it are normalised so 1.0 == the relevant trigger threshold;
+// it tolerates the short dips between laugh syllables, which the old
+// "reset the timer on any dip" rule did not.
+const GATE_OFF_RATIO = 0.85;   // hysteresis: hold evidence down to 85% of threshold
+const laughGate = new LaughAudio.LaughGate({
+  on: 1, off: GATE_OFF_RATIO, sustainMs: LAUGH_SUSTAIN_MS, decayRate: 0.5,
+});
 
 let baselineMouth  = 0.025;
 let baselineCheek  = 0;
@@ -472,12 +479,7 @@ function updateAudioTrigger() {
   // (Only the neural model is trusted alone; the heuristic is too speech-prone.)
   if (faceMesh && (!onnxReady || Date.now() - lastFaceSeenAt < FACE_LOST_MS)) return;
 
-  if (_audioLaughConfidence >= AUDIO_SOLO_THRESHOLD) {
-    if (!laughStartTime) laughStartTime = Date.now();
-    else if (Date.now() - laughStartTime > LAUGH_SUSTAIN_MS) triggerLaugh();
-  } else {
-    laughStartTime = null;
-  }
+  if (laughGate.update(_audioLaughConfidence / AUDIO_SOLO_THRESHOLD, Date.now())) triggerLaugh();
 }
 
 // Original heuristic audio loop (unchanged, used as fallback)
@@ -682,13 +684,10 @@ function onFaceResults(results) {
   }
   // ─────────────
 
-  const shouldAccumulate = blended >= COMBINED_TRIGGER_THRESHOLD || faceScore >= FACE_SOLO_THRESHOLD;
-  if (shouldAccumulate) {
-    if (!laughStartTime) laughStartTime = Date.now();
-    else if (Date.now() - laughStartTime > LAUGH_SUSTAIN_MS) triggerLaugh();
-  } else {
-    laughStartTime = null;
-  }
+  // Either the fused score or a very strong face alone counts; normalise each
+  // by its own threshold so the gate sees 1.0 at whichever fires first.
+  const gateScore = Math.max(blended / COMBINED_TRIGGER_THRESHOLD, faceScore / FACE_SOLO_THRESHOLD);
+  if (laughGate.update(gateScore, Date.now())) triggerLaugh();
 }
 function startDetectionLoop() {
   if (detectionRunning) return;
@@ -923,7 +922,7 @@ function beginPrepPhase() {
   roundActive           = false;
   laughDetectionActive  = false;
   laughTriggered        = false;
-  laughStartTime        = null;
+  laughGate.reset();
   _audioLaughConfidence = 0;
   laughedThisRound.clear();
   document.getElementById('laugh-btn').disabled = true;
@@ -988,7 +987,7 @@ function goRound() {
   roundActive          = true;
   laughDetectionActive = iAmActive;
   laughTriggered       = !iAmActive;
-  laughStartTime       = null;
+  laughGate.reset();
   calibrating          = false;
 
   if (!faceMesh && iAmActive) document.getElementById('laugh-btn').disabled = false;

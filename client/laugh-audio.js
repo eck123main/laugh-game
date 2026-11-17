@@ -23,6 +23,9 @@
   const N_BINS   = N_FFT / 2 + 1;
   const AMIN     = 1e-5;
   const TOP_DB   = 80;
+  // Max distance (in powerToDb's 20·log10(power) units, i.e. ≈30 dB of real
+  // power) the streaming dB reference may fall below the session's loudest frame.
+  const PEAK_FLOOR_DB = 60;
   // Samples covered by one model window (no centre padding when streaming).
   const WINDOW_SAMPLES = (N_FRAMES - 1) * HOP + N_FFT;
 
@@ -140,13 +143,20 @@
       // file to its own max (ref=np.max); a decaying peak approximates that for
       // a live stream without letting one loud cough dominate forever.
       this.peak = 0;
-      this.peakDecay = Math.pow(10, -(3 / 43) / 10); // ≈ -3 dB per second
+      this.peakDecay = Math.pow(10, -(3 / 43) / 10); // power ×0.5 per second
+      // The decaying peak must not sink to the room-noise level: after ~20 s
+      // of quiet it would, and background hiss would then be normalised to
+      // 0 dB like a loud laugh. File-level ref=np.max (as trained) keeps quiet
+      // noise far below the loudest event, so floor the reference at
+      // PEAK_FLOOR_DB (powerToDb units) below the loudest frame this session.
+      this.sessionPeak = 0;
+      this.peakFloorRatio = Math.pow(10, -PEAK_FLOOR_DB / 20);
     }
 
     reset() {
       this.total = 0; this.nextFrameAt = N_FFT; this.nFrames = 0;
       this.samples.fill(0); this.frames.fill(0); this.frameMax.fill(0);
-      this.frameEnergy.fill(0); this.peak = 0;
+      this.frameEnergy.fill(0); this.peak = 0; this.sessionPeak = 0;
     }
 
     push(input) {
@@ -187,7 +197,8 @@
       }
       this.frameMax[slot] = mx;
       this.frameEnergy[slot] = energy / N_FFT;
-      this.peak = Math.max(this.peak * this.peakDecay, mx);
+      if (mx > this.sessionPeak) this.sessionPeak = mx;
+      this.peak = Math.max(this.peak * this.peakDecay, mx, this.sessionPeak * this.peakFloorRatio);
       this.nFrames++;
     }
 
@@ -294,6 +305,39 @@
     decay() { this.value *= (1 - this.alpha); return this.value; }
   }
 
+  // ── Trigger gate: hysteresis + leaky evidence accumulator ─────────────────
+  // Laughter is bursty ("ha – ha – ha"): per-window scores dip between
+  // syllables. A plain "above threshold for N ms, reset on any dip" rule keeps
+  // restarting during real laughs, yet a single long false positive still
+  // fires. Gillick et al. solve this offline with a zero-phase low-pass +
+  // threshold + minimum duration; this is a causal equivalent:
+  //   score ≥ on            → evidence += dt
+  //   off ≤ score < on      → hold (hysteresis band, only once evidence > 0)
+  //   score < off           → evidence -= dt · decayRate   (floored at 0)
+  // and it fires once evidence ≥ sustainMs. Scores are normalised so 1.0 is
+  // the caller's trigger threshold. dt is capped so a stalled tab (big gap
+  // between updates) can't count as sustained laughter.
+  class LaughGate {
+    constructor({ on = 1, off = 0.85, sustainMs = 850, decayRate = 0.5, maxDtMs = 250 } = {}) {
+      if (!(off <= on)) throw new Error('LaughGate: off threshold must be ≤ on threshold');
+      Object.assign(this, { on, off, sustainMs, decayRate, maxDtMs });
+      this.reset();
+    }
+    reset() { this.evidence = 0; this.lastT = null; }
+    // Returns true when the accumulated evidence reaches sustainMs.
+    update(score, nowMs) {
+      const dt = this.lastT === null ? 0 : Math.min(Math.max(nowMs - this.lastT, 0), this.maxDtMs);
+      this.lastT = nowMs;
+      if (score >= this.on) this.evidence += dt;
+      else if (score < this.off || this.evidence === 0) {
+        this.evidence = Math.max(0, this.evidence - dt * this.decayRate);
+      }
+      return this.evidence >= this.sustainMs;
+    }
+    // 0..1 progress towards a trigger (useful for UI / debugging).
+    progress() { return Math.min(this.evidence / this.sustainMs, 1); }
+  }
+
   // ── ONNX model input-shape patch ───────────────────────────────────────────
   // The shipped ONNX declares input "input" as [1, 1, 128, "time"], i.e.
   // mel × time, but the Gillick weights were trained on time × mel
@@ -324,9 +368,9 @@
   }
 
   const api = {
-    SR, N_FFT, HOP, N_MELS, N_FRAMES, WINDOW_SAMPLES,
+    SR, N_FFT, HOP, N_MELS, N_FRAMES, WINDOW_SAMPLES, PEAK_FLOOR_DB,
     hzToMelSlaney, melToHzSlaney, melFilterbank, hannPeriodic, makeFft,
-    LogMelStream, powerToDb, Resampler, ProbSmoother, patchOnnxInputShape,
+    LogMelStream, powerToDb, Resampler, ProbSmoother, LaughGate, patchOnnxInputShape,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.LaughAudio = api;
