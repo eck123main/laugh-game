@@ -467,3 +467,104 @@ was estimated, not measured.
   pitch tracker on the 8 kHz stream would provide it.
 - Still open: the face replay harness, the audio–visual correlation cue,
   MediaPipe blendshapes, and YAMNet.
+
+## Round 6 — 2026-11-18 (prompt: "round 5 of tonight")
+
+### Starting state
+The working tree was clean. Last round's tests had been written but never
+run, so I ran `npm test` first: all 65 passed, including
+`tests/burst-rhythm.test.js`. Nothing needed fixing.
+
+### What changed and why (all committed; tests went from 65 to 72, all pass)
+1. **Voicing cue** (`VoicingCue` in `client/laugh-audio.js`, wired in
+   `game.js`, commit `b44aa03`).
+   - Last round's top idea was Truong & van Leeuwen's unvoiced/voiced
+     duration ratio. Laughter alternates voiced vowels with breathy,
+     unvoiced "h" aspiration, and many laughs are unvoiced grunts or snorts.
+     Sustained voiced sounds don't do that: humming, singing, a held vowel,
+     music, mains hum. The burst-rhythm cue can't catch them when they are
+     steady, or when they pulse with a beat.
+   - How it works:
+     - Every 10 ms, a 40 ms frame (DC removed) gets a normalised
+       autocorrelation over lags for 75–615 Hz. The block counts as voiced
+       if the peak is ≥ 0.5, which is close to Praat's 0.45 voicing
+       threshold.
+     - An octave guard takes the shortest-lag local peak that is within 90%
+       of the best one.
+     - Over the last 1.5 s it counts only "active" blocks (within 25 dB of
+       the loudest), so silent gaps between calls count neither way. At
+       least 20 active blocks are needed; otherwise the cue is neutral.
+     - The scale is `0.9 + 0.1·min(unvoicedRatio/0.2, 1)`, multiplied into
+       the model probability together with the rhythm scale.
+   - It is bounded at −10% like the rhythm cue, so it trims borderline false
+     positives and can't veto a confident laugh. The worst case for a real
+     laugh, with both cues low, is ×0.81.
+   - A/B flag: `localStorage.ogiggleNoVoicing = 1`. The debug log prints
+     `voicing:`.
+   - It also reports the f0 median and spread (in semitones) for
+     diagnostics, but **does not** use pitch as a cue yet. Laughter's f0 is
+     higher and more variable than speech, but absolute ranges overlap
+     across speakers (a male laugh is around 270 Hz, female speech around
+     220 Hz). A per-speaker baseline is needed first.
+2. **Eval harness**: it applies the voicing scale, has a `--no-voicing`
+   flag, and prints each file's median unvoiced ratio and `f0=…Hz±…st`.
+   Recordings will show whether laughs and speech separate on these.
+3. Tests: `tests/voicing-cue.test.js` (6 tests: a held voiced tone, an
+   octave-error guard with a strong 2nd harmonic, noise, "h-a" laugh calls,
+   voiced calls with silent gaps, too little sound and reset). There is also
+   a new eval test: a borderline 0.8 on a steady 220 Hz hum no longer fires.
+   I changed the existing rhythm eval test to pass `voicing: false`, so it
+   still tests rhythm alone.
+4. README: a pipeline-table row and the A/B flag.
+
+### Known trade-off / not verified
+- A *voiced* laugh separated by glottal stops (silence, no "h") reads as
+  fully voiced and loses up to 10% (there is a test documenting this). Its
+  rhythm is usually regular, so the rhythm cue stays at 1.
+- Browser noise suppression might attenuate the breathy "h" sounds and make
+  laughs look more voiced. Compare `unvoiced(median)` on the same clips
+  with and without `ogiggleRawMic`. If NS hurts, raise `full` or lower
+  `voicedR`.
+- None of this has been tried on real recordings. The thresholds (`voicedR`
+  0.5, `activeDb` 25, `full` 0.2) come from the literature and synthetic
+  tests.
+- Some shell commands (python, piped `node --test`) were auto-denied in this
+  session. `npm test` worked, so every change was tested.
+
+### Research
+- Truong & van Leeuwen, "Evaluating automatic laughter segmentation in
+  meetings using acoustic and acoustic-phonetic features" (Interdisciplinary
+  Workshop on the Phonetics of Laughter, 2007): the fraction of unvoiced
+  frames is a feature, motivated by laughter's alternating voicing.
+  https://www.coli.uni-saarland.de/conf/laughter-07/files/TRUONG_LEEUWEN.pdf
+- Petridis & Pantic, laughter vs speech: their prosodic features are the
+  mean/std of pitch and energy plus the unvoiced ratio, over 320 ms windows.
+  https://amlap.coli.uni-saarland.de/conf/laughter-09/files/Petridis_Pantic.pdf
+  and ICME 2009:
+  https://Ibug.Doc.Ic.Ac.Uk/media/uploads/documents/ICME2009-PetridisPantic-CAMERA.pdf
+- Szameitat et al. 2007: laughter f0 is higher than in speech.
+  https://www.coli.uni-saarland.de/conf/laughter-07/files/SZAMEITAT_ET_AL.pdf
+- "Analysis of laugh signals for detecting in continuous speech": pitch
+  ranges overlap between speech and laughter, but pitch *variation* in
+  voiced laughter is larger. This is why pitch is diagnostic-only for now.
+  https://typeset.io/pdf/analysis-of-laugh-signals-for-detecting-in-continuous-speech-1yisj45gxh.pdf
+- "On Laughter and Speech-Laugh" (child-robot interaction, 2019): voicing
+  probability and band-energy modulation capture laughter's repeated
+  voiced/unvoiced change. https://arxiv.org/pdf/1908.11593
+- Bachorowski et al. 2001 (cited last round): many laugh bouts are unvoiced
+  (grunt- or snort-like). That is why the cue only penalises sounds that
+  are *too voiced* and never penalises unvoiced sounds.
+
+### Ideas for next time
+- **Recordings first.** Run `node scripts/eval-audio.js clips` with
+  combinations of `--no-rhythm` and `--no-voicing`, and read the per-file
+  `rhythm(median)` and `unvoiced(median)` columns. If they separate laughs
+  from speech, widen the cues (`minScale` 0.75–0.8) and fit `full`.
+- Pitch relative to the speaker: keep a running median f0 from voiced
+  blocks while the model says "not laughing" (p < 0.2). Then treat voiced
+  f0 well above that baseline (≥ +5 semitones) or a large f0 spread as
+  laugh evidence. `VoicingCue.stats()` already provides the inputs.
+- Move `BurstRhythm`/`VoicingCue` into the AudioWorklet if main-thread time
+  ever matters. They currently cost roughly 10 MFLOP/s together.
+- Still open: the face replay harness, the audio–visual correlation cue,
+  MediaPipe blendshapes, and YAMNet as a second opinion.
