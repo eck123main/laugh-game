@@ -305,3 +305,88 @@ committed them as `f939627`:
 - Offline eval harness: still open, and still the main blocker for tuning any
   threshold with data instead of reasoning.
 - MediaPipe Face Landmarker blendshapes; YAMNet as a second audio opinion.
+
+## Round 4 — 2026-11-18 (prompt: "round 3 of tonight")
+
+### Starting state
+The working tree was clean; round 3 had finished and committed everything.
+
+### What changed and why (all committed; tests went from 50 to 60, all pass)
+1. **Persistence filter on the smile and squint cues** (`CuePersistence` in
+   `client/laugh-face.js`, used in `onFaceResults`, commit `1b265ea`).
+   - Two face cues spiked on non-laugh events:
+     - Spread vowels ("ee", "eh") widen the mouth for ~100–200 ms, which
+       fires the AU12 width cue.
+     - A blink closes the eye for ~100–150 ms, which reads as a full AU6
+       squint.
+   - Every spike added evidence to the leaky `LaughGate` at full rate and
+     leaked at half rate. So a talking or blinking face slowly filled the
+     gate, especially with moderate audio during speech.
+   - Smile and eye now use the 25th percentile over a 350 ms window. Spikes
+     shorter than ~260 ms are dropped. A held laughing smile passes with
+     ~260 ms onset delay.
+   - Right after a reset or a face-lost gap, smile and eye report 0 until
+     the window has filled, so a spike on the first frames can't pass alone.
+   - Mouth opening stays instantaneous. It is already capped at 0.45, and
+     "ha-ha" opening oscillates in real laughs too.
+   - The debug log now prints each cue as `filtered/raw`.
+   - The new tests cover: vowel spikes, blinks, onset delay, gaps at 15 fps,
+     and an end-to-end check that a talking-and-blinking face never fires
+     the face-only route while a held laugh face does.
+2. **`ogiggleRawMic` flag** (`ab7e2c4`). Set `localStorage.ogiggleRawMic = 1`
+   to turn off noise suppression and AGC; echo cancellation stays on. The
+   settings the browser actually applied are logged (also in debug mode).
+   This enables the A/B test that round 3 proposed. The defaults are
+   unchanged, because the mic stream also goes to peers.
+3. **Offline audio eval harness** (`scripts/eval-audio.js`, `58fa247`).
+   - This has been the main blocker since round 1.
+   - It replays WAV clips through the same Resampler → LogMelStream → RMS
+     gate → ResNet → ProbSmoother → LaughGate chain, with `game.js`
+     constants and 1024-sample chunks.
+   - Labels come from the folder: `laugh/` or `laughter/` should fire,
+     anything else should not.
+   - It prints per-file results and sweeps audio-alone thresholds from
+     0.5 to 0.95.
+   - It needs `npm i --no-save onnxruntime-node`, which is deliberately not a
+     dependency.
+   - Tested with a fake model: WAV parsing, the fire time on a confident
+     clip, silence never reaching the model, ~93 ms cadence, and the sweep.
+4. README updated (persistence filter, raw-mic flag, eval usage).
+
+### Not verified
+- `npm i onnxruntime-node` was blocked in this session, so **the harness
+  has not run the real model**. Run it once on any WAV to confirm the ONNX
+  path. The ONNX code mirrors `loadOnnxModel` and `runOnnxInference` in
+  `game.js`.
+- Nothing was run in a browser. Please check that a held smile still raises
+  the crack meter, and that talking or blinking moves it less than before.
+- The 350 ms window and 0.25 quantile are reasoned defaults, not fitted to
+  data.
+
+### Research
+- Petridis & Pantic found that facial geometry during laughter differs
+  clearly from speech, and that adding temporal information beats static
+  features:
+  https://ibug.doc.ic.ac.uk/media/uploads/documents/ICASSP-2008-PetridisPantic-FINAL-CAMERA.pdf ,
+  https://ibug.doc.ic.ac.uk/media/uploads/documents/petridismartinezpantic_imavis.pdf ,
+  https://Ibug.Doc.Ic.Ac.Uk/media/uploads/documents/ICMI-2009-PetridisEtAl-CAMERA.pdf
+- Audio–visual correlation differs between speech and laughter (Petridis et
+  al., FG 2011): https://Ibug.Doc.Ic.Ac.Uk/media/uploads/documents/fg2011.pdf
+- MAHNOB laughter database, a source of labelled audiovisual laughter and
+  speech for tuning:
+  https://www.ibug.doc.ic.ac.uk/media/uploads/documents/mahnob_laughter_db.pdf
+
+### Ideas for next time
+- **Record 20–30 clips and run `scripts/eval-audio.js`.** Include laughs,
+  talking, silence and opponents' laughter played through speakers. Then
+  tune `AUDIO_SOLO_THRESHOLD`, `AUDIO_SOLO_THRESHOLD_FACE_VISIBLE` and
+  `AUDIO_RMS_GATE` from the sweep, and run each clip with and without
+  `ogiggleRawMic`.
+- Extend the harness to the face: log `getFaceFeatures` per frame (with
+  debug on) to JSON, then replay through `scoreFace` + `CuePersistence` +
+  `fusedGateScore` alongside the audio trace.
+- Audio–visual correlation cue (FG 2011 above). In speech, mouth opening
+  tracks the audio envelope syllable by syllable. That coupling looks
+  different in laughter, and it could down-weight talking.
+- Still open: MediaPipe Face Landmarker blendshapes; YAMNet as a second
+  audio opinion.
