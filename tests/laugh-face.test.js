@@ -85,3 +85,9 @@ test('calibrate uses a trimmed mean (robust to a few outlier frames)', () => {
   assert.ok(Math.abs(b.mouth - feats({}).mouth) < 1e-9, `mouth baseline ${b.mouth}`);
   assert.deepEqual(LF.calibrate([]), { ...LF.DEFAULT_BASELINE });
 });
+
+test('laughing through calibration does not disable the mouth cue', () => {
+  const b = LF.calibrate(Array.from({ length: 30 }, () => feats({ open: 0.12 })));
+  assert.ok(b.mouth <= 0.08, `mouth baseline clamped, got ${b.mouth}`);
+  assert.ok(LF.scoreFace(feats({ open: 0.2 }), b).open > 0.5);
+});

@@ -63,6 +63,9 @@
   // their cues are relative, so without a baseline they are simply skipped.
   const DEFAULT_BASELINE = Object.freeze({ mouth: 0.02, width: null, lift: 0, eye: null });
 
+  // A relaxed closed/slightly-parted mouth has height/width ≲ 0.05.
+  const MAX_BASELINE_MOUTH = 0.08;
+
   // Robust baseline: 20–80 % trimmed mean of each feature over the samples.
   function calibrate(samples) {
     const valid = samples.filter(Boolean);
@@ -73,7 +76,12 @@
       const slice = s.slice(lo, hi);
       return slice.reduce((a, b) => a + b, 0) / slice.length;
     };
-    return { mouth: trimmed('mouth'), width: trimmed('width'), lift: trimmed('lift'), eye: trimmed('eye') };
+    // A player already laughing during calibration would otherwise get an
+    // open-mouth "neutral" and become undetectable for the whole round.
+    return {
+      mouth: Math.min(trimmed('mouth'), MAX_BASELINE_MOUTH),
+      width: trimmed('width'), lift: trimmed('lift'), eye: trimmed('eye'),
+    };
   }
 
   function scoreFace(f, base = DEFAULT_BASELINE) {
