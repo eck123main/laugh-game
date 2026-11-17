@@ -221,3 +221,87 @@ EMA smoothing. It also had unit tests. I built on that work and didn't rewrite i
 - Show `laughGate.progress()` as an "about to crack" meter instead of the
   mouth-only bar.
 - Reuse the `getWindow()` buffer (an allocation every ~93 ms).
+
+## Round 3 — 2026-11-18 (prompt: "round 2 of tonight")
+
+### Finishing the interrupted run
+Two face commits (`ce9a78c` 3D landmark distances, `606fca7` calibration
+finishes at round start) had landed after the round-2 report. Changes to
+`laugh-audio.js`/`game.js` were left uncommitted. I added tests for them and
+committed them as `f939627`:
+- **Silence gate on the loudest frame** (`LogMelStream.peakRms()`). Before,
+  a short soft "ha" in an otherwise quiet 1.26 s window was diluted ~5× by
+  the window-mean RMS. It fell under `AUDIO_RMS_GATE` and never reached the
+  model.
+- **`getWindow()` reuses its output buffer.** This was an open idea from
+  rounds 1 and 2. It is safe because `inferenceBusy` prevents overlapping
+  `session.run()` calls.
+
+### What changed and why (all committed; tests went from 45 to 50, all pass)
+1. **Confident audio can fire while a face is visible** (`fusedGateScore` in
+   `laugh-audio.js`, `1359380`).
+   - With a face visible, the only routes were the blend and face-alone. A
+     fully confident ResNet score (1.0) with a neutral or barely moving face
+     gave `0.45 / 0.62 ≈ 0.73` of the trigger, so it could **never** fire.
+     This happens when someone laughs behind a hand, or after a weak
+     calibration.
+   - The same laugh *did* fire as soon as FaceMesh lost the face. That was
+     inconsistent and a real source of missed laughs.
+   - New third route: audio alone ≥ 0.88 (stricter than the 0.75 used when
+     no face is visible). It applies to the neural model only; the heuristic
+     fallback stays disabled for this route.
+   - While opponents are audible, far-end scaling (×0.6) keeps this route
+     below 1.0, so leaked opponent laughter still can't fire it.
+   - Audio estimates older than 500 ms now count as 0. A stalled audio
+     pipeline (suspended context, hung inference) used to leave its last,
+     possibly high, value feeding the fusion forever.
+2. **Crack meter** (`0db4b60`). During a round, the bar under the cams now
+   shows `laughGate.progress()`, which is what actually decides a trigger.
+   Before, it showed mouth opening only, which no longer drives triggering.
+   Outside rounds (including calibration) it still shows mouth opening.
+3. README fusion row updated.
+
+### Not verified
+- Nothing was run in a browser; only `npm test`. Please check:
+  - the bar label switches to "crack meter" when a round starts
+  - laughing with a hand over your mouth now triggers
+  - opponents laughing through your speakers still doesn't trigger
+- The 0.88 threshold is a reasoned default. If speech falsely triggers with a
+  face visible, raise `AUDIO_SOLO_THRESHOLD_FACE_VISIBLE` in `game.js`.
+
+### Research
+- Frame-wise (non-presegmented) laughter detection with MFCC, autocorrelation
+  peak and F0 features reached 7.9 % EER on ICSI. Voicing and periodicity
+  are what separate laughter from speech:
+  Knox & Mirghafori, Interspeech 2007,
+  https://www.isca-archive.org/interspeech_2007/knox07_interspeech.pdf
+- Laughter differs from speech in pitch and in its alternating
+  voiced/unvoiced pattern:
+  Truong & van Leeuwen, https://www.coli.uni-saarland.de/conf/laughter-07/files/TRUONG_LEEUWEN.pdf
+- Modulation spectrum (syllable rate) and MFCC + SVM for meeting laughter:
+  Kennedy & Ellis, https://www.ee.columbia.edu/~lyndon/pubs/nistrt2004-laughter.pdf ;
+  Krikke & Truong, https://www.isca-archive.org/interspeech_2013/krikke13_interspeech.pdf
+- Audiovisual laughter: cepstral audio features and facial expression are
+  the strongest cues, and pitch/energy alone are weak. This supports keeping
+  an audio-alone route next to the face:
+  https://amlap.coli.uni-saarland.de/conf/laughter-09/presentations/Petridis_Pantic.pdf
+- Browser audio processing: noise suppression targets non-speech sounds, so
+  it may attenuate laughter. Chrome's AGC compresses loud bursts. No study
+  measures the effect on laughter, so it has to be tested:
+  https://blog.addpipe.com/audio-constraints-getusermedia/ ,
+  https://developer.chrome.google.cn/blog/disabling-hardware-noise-suppression?hl=en ,
+  https://developer.mozilla.org/en-US/docs/Web/API/MediaTrackSettings/noiseSuppression
+
+### Ideas for next time
+- **A/B test the mic constraints.** Record the same laughs with
+  `noiseSuppression`/`autoGainControl` on and off, and compare ResNet
+  probabilities. If off is clearly better, request a second detection-only
+  track. Check `track.getSettings()`, because Chrome may share processing
+  per device.
+- **Speech-vs-laugh audio cue.** A cheap autocorrelation-based
+  voiced/unvoiced alternation or a 3–6 Hz energy-modulation score on the
+  8 kHz stream could down-weight speech before the gate (Knox 2007, Truong).
+  This should be tuned against recordings.
+- Offline eval harness: still open, and still the main blocker for tuning any
+  threshold with data instead of reasoning.
+- MediaPipe Face Landmarker blendshapes; YAMNet as a second audio opinion.
