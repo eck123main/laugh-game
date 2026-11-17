@@ -395,6 +395,76 @@
     return Math.max(blended / combinedThreshold, face / faceSoloThreshold, a / audioSoloThreshold);
   }
 
+  // ── Burst-rhythm cue (laughter vs speech / noise) ─────────────────────────
+  // Laughter is a train of near-identical "ha" calls repeated every ~150–350
+  // ms (Bachorowski et al. 2001; Provine 1996): the short-time energy envelope
+  // is strongly periodic. Speech syllables are irregular in length and
+  // loudness; a cough or door slam is one burst; a fan is flat. The ResNet
+  // sees only a 1.26 s spectrogram with 256 ms frames, too coarse to resolve
+  // 100 ms calls, so this adds a cheap, independent temporal cue.
+  // push() 8 kHz samples; regularity() returns the peak normalised
+  // autocorrelation of the dB energy envelope (10 ms blocks, last 1.5 s) over
+  // lags 120–400 ms, in [0, 1]. scale() maps it to a multiplier for the model
+  // probability: minScale when there is no rhythm, 1 once regularity ≥ full.
+  class BurstRhythm {
+    constructor({ blockSamples = 80, nBlocks = 150, minLag = 12, maxLag = 40,
+      rangeDb = 30, minScale = 0.9, full = 0.45 } = {}) {
+      Object.assign(this, { blockSamples, nBlocks, minLag, maxLag, rangeDb, minScale, full });
+      this.env = new Float32Array(nBlocks);
+      this._x = new Float64Array(nBlocks);
+      this.reset();
+    }
+    reset() { this.env.fill(0); this.count = 0; this.acc = 0; this.accN = 0; }
+    push(samples) {
+      for (let i = 0; i < samples.length; i++) {
+        this.acc += samples[i] * samples[i];
+        if (++this.accN === this.blockSamples) {
+          this.env[this.count % this.nBlocks] = 10 * Math.log10(this.acc / this.blockSamples + 1e-10);
+          this.count++; this.acc = 0; this.accN = 0;
+        }
+      }
+    }
+    regularity() {
+      const n = Math.min(this.count, this.nBlocks);
+      if (n < 2 * this.maxLag) return 0;
+      const x = this._x, start = this.count - n;
+      let mx = -Infinity;
+      for (let i = 0; i < n; i++) {
+        x[i] = this.env[(start + i) % this.nBlocks];
+        if (x[i] > mx) mx = x[i];
+      }
+      // Clip the floor so room noise between calls reads as flat silence.
+      let mean = 0;
+      for (let i = 0; i < n; i++) { x[i] = Math.max(x[i], mx - this.rangeDb); mean += x[i]; }
+      mean /= n;
+      let varSum = 0;
+      for (let i = 0; i < n; i++) { x[i] -= mean; varSum += x[i] * x[i]; }
+      if (varSum / n < 1) return 0;   // < 1 dB std: steady noise, no bursts
+      // r[L] for L = 0..maxLag+1. A smooth envelope (one long burst, a held
+      // vowel) is self-similar at short lags without being periodic, so only
+      // count a lag if it is a local maximum AND the envelope decorrelated
+      // (r < 0) at some shorter lag: on/off calls do, a single burst doesn't.
+      const r = this._r || (this._r = new Float64Array(this.maxLag + 2));
+      r[0] = 1;
+      for (let L = 1; L <= this.maxLag + 1; L++) {
+        let xy = 0, xx = 0, yy = 0;
+        for (let i = 0; i + L < n; i++) { const a = x[i], b = x[i + L]; xy += a * b; xx += a * a; yy += b * b; }
+        r[L] = xy / Math.sqrt(xx * yy + 1e-12);
+      }
+      let best = 0, minBefore = Infinity;
+      for (let L = 1; L <= this.maxLag; L++) {
+        minBefore = Math.min(minBefore, r[L - 1]);
+        if (L >= this.minLag && minBefore < 0 && r[L] >= r[L - 1] && r[L] >= r[L + 1] && r[L] > best) best = r[L];
+      }
+      return best;
+    }
+    scale() {
+      const r = this.regularity();
+      if (r >= this.full) return 1;
+      return this.minScale + (1 - this.minScale) * (r / this.full);
+    }
+  }
+
   // Root-mean-square of a Float32Array.
   function rmsOf(x) {
     let s = 0;
@@ -434,7 +504,7 @@
   const api = {
     SR, N_FFT, HOP, N_MELS, N_FRAMES, WINDOW_SAMPLES, PEAK_FLOOR_DB,
     hzToMelSlaney, melToHzSlaney, melFilterbank, hannPeriodic, makeFft,
-    LogMelStream, powerToDb, Resampler, ProbSmoother, LaughGate, FarEndGuard, fusedGateScore, rmsOf, patchOnnxInputShape,
+    LogMelStream, powerToDb, Resampler, ProbSmoother, LaughGate, FarEndGuard, BurstRhythm, fusedGateScore, rmsOf, patchOnnxInputShape,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.LaughAudio = api;

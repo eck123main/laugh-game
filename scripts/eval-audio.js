@@ -6,7 +6,9 @@
 //
 // Usage:
 //   npm i --no-save onnxruntime-node        # once; not a project dependency
-//   node scripts/eval-audio.js <wav files or dirs...> [--trace]
+//   node scripts/eval-audio.js <wav files or dirs...> [--trace] [--no-rhythm]
+// --no-rhythm turns off the BurstRhythm scaling (like ogiggleNoRhythm in the
+// browser); each file also prints its median rhythm regularity.
 //
 // Labels come from the path: a file under a directory named "laugh" or
 // "laughter" should fire, anything else should not. Example layout:
@@ -25,6 +27,7 @@ const LA = require('../client/laugh-audio.js');
 const DEFAULTS = Object.freeze({
   chunk: 1024, inferEveryFrames: 4, rmsGate: 0.008, smoothAlpha: 0.5,
   soloThreshold: 0.75, gateOff: 0.85, sustainMs: 850, decayRate: 0.5,
+  rhythm: true,   // BurstRhythm scaling (pass --no-rhythm to compare)
 });
 
 // Minimal RIFF/WAVE reader → { sampleRate, samples: Float32Array (mono) }.
@@ -69,18 +72,25 @@ async function simulate(samples, sampleRate, infer, opts = {}) {
   const resampler = new LA.Resampler(sampleRate, LA.SR || 8000);
   const stream = new LA.LogMelStream();
   const smoother = new LA.ProbSmoother(o.smoothAlpha);
+  const rhythm = new LA.BurstRhythm();
   const trace = [];
   let frames = 0, raw = 0;
   for (let i = 0; i < samples.length; i += o.chunk) {
     const chunk = samples.subarray(i, Math.min(i + o.chunk, samples.length));
-    frames += stream.push(resampler.process(chunk));
+    const s8k = resampler.process(chunk);
+    frames += stream.push(s8k);
+    rhythm.push(s8k);
     if (frames < o.inferEveryFrames || !stream.ready()) continue;
     frames = 0;
     const t = ((i + chunk.length) / sampleRate) * 1000;
-    let p;
+    let p, r = null;
     if (stream.peakRms() < o.rmsGate) p = smoother.decay();
-    else { raw = Math.min(Math.max(await infer(stream.getWindow()), 0), 1); p = smoother.update(raw); }
-    trace.push({ t, p });
+    else {
+      raw = Math.min(Math.max(await infer(stream.getWindow()), 0), 1);
+      r = rhythm.regularity();
+      p = smoother.update(raw * (o.rhythm ? rhythm.scale() : 1));
+    }
+    trace.push({ t, p, r });
   }
   return { trace, firedAt: gateOnTrace(trace, o.soloThreshold, o) };
 }
@@ -128,15 +138,18 @@ async function main(argv) {
   const files = collectWavs(argv.filter((a) => !a.startsWith('--')));
   if (!files.length) { console.error('usage: node scripts/eval-audio.js <wav files or dirs...> [--trace]'); process.exit(2); }
   const infer = await loadModel();
+  const opts = { rhythm: !argv.includes('--no-rhythm') };
   const results = [];
   for (const f of files) {
     const { sampleRate, samples } = parseWav(fs.readFileSync(f));
-    const { trace, firedAt } = await simulate(samples, sampleRate, infer);
+    const { trace, firedAt } = await simulate(samples, sampleRate, infer, opts);
     const peak = trace.reduce((m, x) => Math.max(m, x.p), 0);
     const laugh = isLaughPath(f);
     results.push({ f, laugh, trace });
     const ok = (firedAt !== null) === laugh ? 'ok  ' : 'MISS';
-    console.log(`${ok} ${laugh ? 'laugh' : 'other'}  fired=${firedAt === null ? '-' : (firedAt / 1000).toFixed(2) + 's'}  peak=${peak.toFixed(2)}  ${f}`);
+    const rs = trace.filter((x) => x.r !== null).map((x) => x.r).sort((a, b) => a - b);
+    const rMed = rs.length ? rs[rs.length >> 1].toFixed(2) : '-';
+    console.log(`${ok} ${laugh ? 'laugh' : 'other'}  fired=${firedAt === null ? '-' : (firedAt / 1000).toFixed(2) + 's'}  peak=${peak.toFixed(2)}  rhythm(median)=${rMed}  ${f}`);
     if (showTrace) console.log('     ' + trace.map((x) => x.p.toFixed(2)).join(' '));
   }
   console.log('\nthreshold  recall(laugh fired)  false-fire(other fired)');

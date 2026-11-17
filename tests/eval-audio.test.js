@@ -44,6 +44,15 @@ test('simulate: a confident 3 s "laugh" fires the audio-alone gate; silence neve
   assert.ok(quiet.trace.length > 10);
 });
 
+test('simulate: a borderline score on a steady (rhythm-less) sound is pushed below threshold by BurstRhythm', async () => {
+  const sr = 8000;
+  const off = await EV.simulate(tone(3, sr), sr, () => 0.8, { rhythm: false });
+  assert.ok(off.firedAt !== null, 'fires without the rhythm cue');
+  const on = await EV.simulate(tone(3, sr), sr, () => 0.8, { rhythm: true });
+  assert.equal(on.firedAt, null, '0.8 × 0.9 < 0.75 for a flat tone');
+  assert.ok(on.trace.some((x) => x.r === 0));
+});
+
 test('simulate: inference cadence is ~93 ms like the browser', async () => {
   const sr = 8000;
   const { trace } = await EV.simulate(tone(4, sr), sr, () => 0.1);
