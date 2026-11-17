@@ -83,128 +83,42 @@ let _audioLaughConfidence = 0;
 // ─── ResNet ONNX model state ──────────────────────────────
 let onnxSession    = null;   // ort.InferenceSession once loaded
 let onnxReady      = false;  // true after model loads successfully
-let onnxRingBuffer = null;   // Float32Array ring buffer at 8 kHz
-let onnxWritePtr   = 0;
-let onnxFramesSinceInference = 0;
+let onnxTimeMajor  = true;   // model input laid out [1,1,time,mel] (as trained)
+let laughStream    = null;   // LaughAudio.LogMelStream (8 kHz log-mel frames)
+let audioResampler = null;   // LaughAudio.Resampler (native rate → 8 kHz)
+let probSmoother   = null;   // LaughAudio.ProbSmoother
+let inferenceBusy  = false;  // never overlap session.run() calls
+let framesSinceInference = 0;
+let lastFaceSeenAt = 0;      // ms timestamp of the last frame with a face
 
-const ONNX_SAMPLE_RATE = 8000;
-const ONNX_WINDOW_SIZE = 2680;   // 1-second window
-const ONNX_HOP_SIZE    = 800;    // run inference every 100 ms
-const ONNX_MODEL_PATH  = '/models/laughter_resnet.onnx';
-
-// ─── Mel spectrogram constants (match Gillick et al.) ─────
-const MEL_N_BINS   = 128;
-const MEL_WIN_SAMP = 200;   // 25 ms at 8 kHz
-const MEL_HOP_SAMP = 80;    // 10 ms at 8 kHz
-const MEL_F_MIN    = 60;
-const MEL_F_MAX    = 3800;
-
-// Pre-compute Hann window
-const HANN = new Float32Array(MEL_WIN_SAMP);
-for (let i = 0; i < MEL_WIN_SAMP; i++) {
-  HANN[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (MEL_WIN_SAMP - 1)));
-}
-
-// Pre-compute mel filterbank (MEL_N_BINS filters × (MEL_WIN_SAMP/2+1) FFT bins)
-const MEL_FILTERS = buildMelFilterbank(MEL_N_BINS, MEL_WIN_SAMP, ONNX_SAMPLE_RATE, MEL_F_MIN, MEL_F_MAX);
-
-function hzToMel(hz) { return 2595 * Math.log10(1 + hz / 700); }
-function melToHz(m)  { return 700 * (Math.pow(10, m / 2595) - 1); }
-
-function buildMelFilterbank(nFilters, winSamp, sr, fMin, fMax) {
-  const nFft  = winSamp;
-  const nBins = Math.floor(nFft / 2) + 1;
-  const melMin = hzToMel(fMin);
-  const melMax = hzToMel(fMax);
-
-  // nFilters + 2 evenly-spaced mel points → Hz → FFT bin indices
-  const melPoints = new Float32Array(nFilters + 2);
-  for (let i = 0; i < nFilters + 2; i++) {
-    melPoints[i] = melToHz(melMin + (melMax - melMin) * i / (nFilters + 1));
-  }
-  const binPoints = melPoints.map(hz => Math.floor((nFft + 1) * hz / sr));
-
-  // Build filter matrix as flat Float32Array[nFilters * nBins]
-  const filters = new Float32Array(nFilters * nBins);
-  for (let m = 1; m <= nFilters; m++) {
-    const lo  = binPoints[m - 1];
-    const ctr = binPoints[m];
-    const hi  = binPoints[m + 1];
-    for (let k = lo; k < ctr && k < nBins; k++) {
-      filters[(m - 1) * nBins + k] = (k - lo) / Math.max(ctr - lo, 1);
-    }
-    for (let k = ctr; k <= hi && k < nBins; k++) {
-      filters[(m - 1) * nBins + k] = (hi - k) / Math.max(hi - ctr, 1);
-    }
-  }
-  return { filters, nBins, nFilters };
-}
-
-// Real-valued FFT magnitude via DFT (good enough for 200-sample windows)
-function rfftMag(frame) {
-  const N    = frame.length;
-  const nOut = Math.floor(N / 2) + 1;
-  const mag  = new Float32Array(nOut);
-  for (let k = 0; k < nOut; k++) {
-    let re = 0, im = 0;
-    for (let n = 0; n < N; n++) {
-      const angle = -2 * Math.PI * k * n / N;
-      re += frame[n] * Math.cos(angle);
-      im += frame[n] * Math.sin(angle);
-    }
-    mag[k] = Math.sqrt(re * re + im * im);
-  }
-  return mag;
-}
-
-// Compute log mel spectrogram from a 1-second mono float32 clip at ONNX_SAMPLE_RATE
-// Returns Float32Array of shape [MEL_N_BINS × nFrames], row-major (bins fastest)
-function computeLogMelSpectrogram(audio) {
-  const nFrames = Math.floor((audio.length - MEL_WIN_SAMP) / MEL_HOP_SAMP) + 1;
-  const { filters, nBins, nFilters } = MEL_FILTERS;
-  // Output: [nFilters × nFrames], stored as [frame * nFilters + bin]
-  const spec = new Float32Array(nFilters * nFrames);
-
-  for (let f = 0; f < nFrames; f++) {
-    const start = f * MEL_HOP_SAMP;
-    // Windowed frame
-    const frame = new Float32Array(MEL_WIN_SAMP);
-    for (let i = 0; i < MEL_WIN_SAMP; i++) frame[i] = audio[start + i] * HANN[i];
-    // FFT magnitudes
-    const mag = rfftMag(frame);
-    // Apply mel filterbank
-    for (let m = 0; m < nFilters; m++) {
-      let energy = 0;
-      const offset = m * nBins;
-      for (let k = 0; k < nBins; k++) energy += filters[offset + k] * mag[k];
-      spec[f * nFilters + m] = Math.log(Math.max(energy, 1e-9));
-    }
-  }
-
-  // Transpose to [nFilters × nFrames] (bins × time — what ResNet-18 expects as channels × H × W)
-  // Here we return it as a flat [1 × 1 × nFilters × nFrames] tensor buffer
-  const transposed = new Float32Array(nFilters * nFrames);
-  for (let f = 0; f < nFrames; f++) {
-    for (let m = 0; m < nFilters; m++) {
-      transposed[m * nFrames + f] = spec[f * nFilters + m];
-    }
-  }
-  return { data: transposed, nFilters, nFrames };
-}
+const ONNX_SAMPLE_RATE    = 8000;
+const INFER_EVERY_FRAMES  = 4;      // 4 × 186 samples ≈ 93 ms between inferences
+const AUDIO_RMS_GATE      = 0.008;  // below this the window is treated as silence
+const FACE_LOST_MS        = 600;    // after this long without a face, audio decides alone
+const ONNX_MODEL_PATH     = '/models/laughter_resnet.onnx';
 
 // ─── Load ONNX model ──────────────────────────────────────
+// Features + model notes live in laugh-audio.js. The shipped model declares
+// its input as [1,1,128,time] but the Gillick weights were trained on
+// [1,1,44 time,128 mel]; we patch the declaration in memory so we can feed the
+// layout the network actually learned.
 async function loadOnnxModel() {
-  if (typeof ort === 'undefined') {
-    console.warn('onnxruntime-web not loaded — falling back to heuristic audio');
+  if (typeof ort === 'undefined' || typeof LaughAudio === 'undefined') {
+    console.warn('onnxruntime-web / laugh-audio not loaded — falling back to heuristic audio');
     return false;
   }
   try {
-    onnxSession    = await ort.InferenceSession.create(ONNX_MODEL_PATH);
-    onnxReady      = true;
-    onnxRingBuffer = new Float32Array(ONNX_WINDOW_SIZE * 2);
-
-    onnxWritePtr   = 0;
-    console.log('ResNet laughter model loaded ✓');
+    const resp  = await fetch(ONNX_MODEL_PATH);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const bytes   = new Uint8Array(await resp.arrayBuffer());
+    const patched = LaughAudio.patchOnnxInputShape(bytes);
+    onnxTimeMajor = !!patched;
+    if (!patched) console.warn('ONNX input signature not found; feeding mel×time layout');
+    onnxSession   = await ort.InferenceSession.create(patched || bytes);
+    onnxReady     = true;
+    laughStream   = new LaughAudio.LogMelStream();
+    probSmoother  = new LaughAudio.ProbSmoother(0.5);
+    console.log('ResNet laughter model loaded ✓ (layout:', onnxTimeMajor ? 'time×mel' : 'mel×time', ')');
     return true;
   } catch (e) {
     console.warn('ONNX model failed to load, falling back to heuristic audio:', e);
@@ -212,22 +126,23 @@ async function loadOnnxModel() {
   }
 }
 
-// Run model on the current 1-second ring-buffer window.
+// Run model on the current ~1.26 s window (44 frames).
 // Returns a probability in [0, 1] for the "laugh" class.
 async function runOnnxInference() {
-  if (!onnxReady || !onnxSession) return null;
+  if (!onnxReady || !onnxSession || !laughStream || !laughStream.ready()) return null;
+  const { N_FRAMES, N_MELS } = LaughAudio;
   try {
-    const clip = new Float32Array(ONNX_WINDOW_SIZE);
-    for (let i = 0; i < ONNX_WINDOW_SIZE; i++) {
-      clip[i] = onnxRingBuffer[(onnxWritePtr - ONNX_WINDOW_SIZE + i + onnxRingBuffer.length) % onnxRingBuffer.length];
+    let data = laughStream.getWindow();
+    let dims = [1, 1, N_FRAMES, N_MELS];
+    if (!onnxTimeMajor) {
+      const t = new Float32Array(data.length);
+      for (let f = 0; f < N_FRAMES; f++)
+        for (let m = 0; m < N_MELS; m++) t[m * N_FRAMES + f] = data[f * N_MELS + m];
+      data = t; dims = [1, 1, N_MELS, N_FRAMES];
     }
-
-    const { data, nFilters, nFrames } = computeLogMelSpectrogram(clip);
-    const tensor = new ort.Tensor('float32', data, [1, 1, nFilters, nFrames]);
-    const output = await onnxSession.run({ input: tensor });
-
-    const raw = output[Object.keys(output)[0]].data;
-    // Model outputs a single sigmoid value — just use it directly
+    const tensor = new ort.Tensor('float32', data, dims);
+    const output = await onnxSession.run({ [onnxSession.inputNames[0]]: tensor });
+    const raw = output[onnxSession.outputNames[0]].data;
     return Math.min(Math.max(raw[0], 0), 1);
   } catch (e) {
     console.warn('ONNX inference error:', e);
@@ -376,7 +291,12 @@ async function offerTo(peerId) {
 async function startCamera() {
   if (localStream) return;
   try {
-    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    // Echo cancellation keeps the opponents' laughter (played through our
+    // speakers) from being picked up by our mic and counted as *our* laugh.
+    localStream = await navigator.mediaDevices.getUserMedia({
+      video: true,
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
     const vid = document.getElementById('video-' + me());
     if (vid) { vid.srcObject = localStream; vid.muted = true; hideOverlay('overlay-' + me()); }
   } catch (e) { console.warn('Camera unavailable:', e); }
@@ -468,63 +388,66 @@ async function initAudioDetection() {
   const modelLoaded = await loadOnnxModel();
 
   try {
-    // Use 8 kHz if ONNX model loaded (matches training), otherwise browser default
-    const ctxOptions = modelLoaded ? { sampleRate: ONNX_SAMPLE_RATE } : {};
-    audioCtx = new AudioContext(ctxOptions);
+    // Prefer an 8 kHz context (browser resamples with a proper filter). Some
+    // browsers (Firefox) refuse to connect a mic stream to a context at a
+    // different rate, so fall back to the native rate + our own resampler.
+    audioCtx = null;
+    let source = null;
+    if (modelLoaded) {
+      try {
+        audioCtx = new AudioContext({ sampleRate: ONNX_SAMPLE_RATE });
+        source   = audioCtx.createMediaStreamSource(localStream);
+      } catch (e) {
+        console.warn('8 kHz AudioContext unavailable, resampling in JS:', e);
+        if (audioCtx) { try { audioCtx.close(); } catch (_) {} }
+        audioCtx = null;
+      }
+    }
+    if (!audioCtx) {
+      audioCtx = new AudioContext();
+      source   = audioCtx.createMediaStreamSource(localStream);
+    }
     if (audioCtx.state === 'suspended') audioCtx.resume();
 
-    const source = audioCtx.createMediaStreamSource(localStream);
-
     if (modelLoaded) {
-      // ── ResNet path: ScriptProcessor feeds ring buffer; inference runs on hop ──
-      const bufferSize = 512;
-      scriptProcessor = audioCtx.createScriptProcessor(bufferSize, 1, 1);
+      // ── ResNet path: ScriptProcessor → resampler → log-mel stream → model ──
+      audioResampler = new LaughAudio.Resampler(audioCtx.sampleRate, ONNX_SAMPLE_RATE);
+      laughStream.reset();
+      probSmoother.reset();
+      framesSinceInference = 0;
+
+      scriptProcessor = audioCtx.createScriptProcessor(1024, 1, 1);
       source.connect(scriptProcessor);
-      scriptProcessor.connect(audioCtx.destination);
+      scriptProcessor.connect(audioCtx.destination);   // output stays silent
 
-      scriptProcessor.onaudioprocess = async (e) => {
-  if (!audioCtx) return;
-  const input = e.inputBuffer.getChannelData(0);
-  const nativeSR = audioCtx.sampleRate;
-  
-  // Downsample to 8kHz if needed
-  if (nativeSR !== ONNX_SAMPLE_RATE) {
-    const ratio = nativeSR / ONNX_SAMPLE_RATE;
-    for (let i = 0; i < input.length; i += ratio) {
-      const idx = Math.floor(i);
-      onnxRingBuffer[onnxWritePtr % onnxRingBuffer.length] = input[idx];
-      onnxWritePtr++;
-      onnxFramesSinceInference++;
-    }
-  } else {
-    for (let i = 0; i < input.length; i++) {
-      onnxRingBuffer[onnxWritePtr % onnxRingBuffer.length] = input[i];
-      onnxWritePtr++;
-    }
-    onnxFramesSinceInference += input.length;
-  }
+      scriptProcessor.onaudioprocess = (e) => {
+        if (!audioCtx || !laughStream) return;
+        const samples = audioResampler.process(e.inputBuffer.getChannelData(0));
+        framesSinceInference += laughStream.push(samples);
 
-  if (onnxFramesSinceInference < ONNX_HOP_SIZE) return;
-  onnxFramesSinceInference = 0;
+        if (framesSinceInference < INFER_EVERY_FRAMES || inferenceBusy) return;
+        framesSinceInference = 0;
 
-  if (!laughDetectionActive || laughTriggered) {
-    _audioLaughConfidence = 0;
-    return;
-  }
+        if (!laughDetectionActive || laughTriggered) {
+          _audioLaughConfidence = 0;
+          probSmoother.reset();
+          return;
+        }
+        if (!laughStream.ready()) return;
+        if (laughStream.rms() < AUDIO_RMS_GATE) {
+          _audioLaughConfidence = probSmoother.decay();
+          updateAudioTrigger();
+          return;
+        }
 
-  let rmsSum = 0;
-  for (let i = 0; i < ONNX_WINDOW_SIZE; i++) {
-    const s = onnxRingBuffer[(onnxWritePtr - ONNX_WINDOW_SIZE + i + onnxRingBuffer.length) % onnxRingBuffer.length];
-    rmsSum += s * s;
-  }
-  const rms = Math.sqrt(rmsSum / ONNX_WINDOW_SIZE);
-  if (rms < 0.01) { _audioLaughConfidence = 0; return; }
-
-  const prob = await runOnnxInference();
-  if (prob === null) return;
-  _audioLaughConfidence = prob;
-  updateAudioTrigger();
-};
+        inferenceBusy = true;
+        runOnnxInference().then((prob) => {
+          inferenceBusy = false;
+          if (prob === null || !laughDetectionActive) return;
+          _audioLaughConfidence = probSmoother.update(prob);
+          updateAudioTrigger();
+        });
+      };
 
       console.log('Audio detection: ResNet ONNX mode');
     } else {
@@ -541,8 +464,13 @@ async function initAudioDetection() {
 }
 
 // Called after each ONNX inference (or heuristic frame) to check for laugh trigger
+// When FaceMesh is running and sees a face, onFaceResults fuses face+audio and
+// owns the trigger. If the face is lost (turned away, covered by a hand —
+// common while laughing!) audio decides on its own instead of being ignored.
 function updateAudioTrigger() {
-  if (!laughDetectionActive || laughTriggered || faceMesh) return;
+  if (!laughDetectionActive || laughTriggered) return;
+  // (Only the neural model is trusted alone; the heuristic is too speech-prone.)
+  if (faceMesh && (!onnxReady || Date.now() - lastFaceSeenAt < FACE_LOST_MS)) return;
 
   if (_audioLaughConfidence >= AUDIO_SOLO_THRESHOLD) {
     if (!laughStartTime) laughStartTime = Date.now();
@@ -710,6 +638,7 @@ function initFaceDetection() {
 
 function onFaceResults(results) {
   if (!results.multiFaceLandmarks || !results.multiFaceLandmarks.length) return;
+  lastFaceSeenAt = Date.now();
   const lm = results.multiFaceLandmarks[0];
   const { mouth, cheek, eyeApert } = getFaceFeatures(lm);
 
@@ -1181,7 +1110,11 @@ function cleanup() {
   laughDetectionActive  = false;
   calibrating           = false;
   _audioLaughConfidence = 0;
-  onnxFramesSinceInference = 0;
+  framesSinceInference  = 0;
+  inferenceBusy         = false;
+  audioResampler        = null;
+  if (laughStream)  laughStream.reset();
+  if (probSmoother) probSmoother.reset();
 
   if (scriptProcessor) {
     try { scriptProcessor.disconnect(); } catch (_) {}
