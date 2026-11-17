@@ -256,6 +256,24 @@ test('FarEndGuard is active while remote audio is loud, plus a hold time', () =>
   assert.equal(g.active(900), false);
 });
 
+test('fusedGateScore: confident audio fires even with a neutral visible face', () => {
+  // Old blend-only rule: 0.45 / 0.62 ≈ 0.73 — could never reach the gate.
+  assert.ok(LA.fusedGateScore({ face: 0, audio: 0.95 }) >= 1);
+  assert.ok(LA.fusedGateScore({ face: 0, audio: 0.8 }) < 1, 'moderate audio alone is not enough');
+});
+
+test('fusedGateScore keeps the blend and face-solo routes', () => {
+  close(LA.fusedGateScore({ face: 0.6, audio: 0.6 }), (0.6 * 0.55 + 0.6 * 0.45) / 0.62, 1e-9);
+  close(LA.fusedGateScore({ face: 0.8, audio: 0 }), 1, 1e-9);
+  assert.ok(LA.fusedGateScore({ face: 0.3, audio: 0.3 }) < 1);
+});
+
+test('fusedGateScore ignores stale audio and respects far-end scaling', () => {
+  assert.equal(LA.fusedGateScore({ face: 0, audio: 1, audioAgeMs: 2000 }), 0);
+  assert.ok(LA.fusedGateScore({ face: 0, audio: 1, audioScale: 0.6 }) < 1, 'far-end leak cannot fire alone');
+  assert.ok(LA.fusedGateScore({ face: 0, audio: 1 }, { audioSoloThreshold: Infinity }) < 1, 'route can be disabled');
+});
+
 test('rmsOf', () => {
   close(LA.rmsOf(Float32Array.from([3, -4, 3, -4])), Math.sqrt(12.5), 1e-6);
   assert.equal(LA.rmsOf(new Float32Array(0)), 0);

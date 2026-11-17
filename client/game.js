@@ -87,6 +87,10 @@ let detectionCanvas, detectionCtx;
 let detectionRunning = false;
 
 let _audioLaughConfidence = 0;
+let audioUpdatedAt        = 0;   // ms timestamp of the last ResNet audio estimate
+// Audio alone may fire even while the face is visible (laughing behind a
+// hand, weak face calibration), but needs more than when the face is lost.
+const AUDIO_SOLO_THRESHOLD_FACE_VISIBLE = 0.88;
 
 // ─── ResNet ONNX model state ──────────────────────────────
 let onnxSession    = null;   // ort.InferenceSession once loaded
@@ -480,6 +484,7 @@ async function initAudioDetection() {
         if (!laughStream.ready()) return;
         if (laughStream.peakRms() < AUDIO_RMS_GATE) {
           _audioLaughConfidence = probSmoother.decay();
+          audioUpdatedAt = Date.now();
           updateAudioTrigger();
           return;
         }
@@ -489,6 +494,7 @@ async function initAudioDetection() {
           inferenceBusy = false;
           if (prob === null || !laughDetectionActive) return;
           _audioLaughConfidence = probSmoother.update(prob);
+          audioUpdatedAt = Date.now();
           updateAudioTrigger();
         });
       };
@@ -707,9 +713,24 @@ function onFaceResults(results) {
   // threshold — so a face-only trigger needs smile/eye cues too.
   const face      = LaughFace.scoreFace(features, faceBaseline);
   const faceScore = face.score;
-  const farEnd    = farEndGuard.active(Date.now());
+  const now       = Date.now();
+  const farEnd    = farEndGuard.active(now);
   const audioConf = _audioLaughConfidence * (farEnd ? FAR_END_AUDIO_SCALE : 1);
   const blended   = (faceScore * FACE_WEIGHT) + (audioConf * AUDIO_WEIGHT);
+  // Either the fused score, a very strong face, or (neural model only) very
+  // confident audio counts; each is normalised by its own threshold so the
+  // gate sees 1.0 at whichever fires first. Far-end scaling (×0.6) keeps the
+  // audio-alone route below 1.0 while opponents are audible.
+  const gateScore = LaughAudio.fusedGateScore({
+    face: faceScore,
+    audio: _audioLaughConfidence,
+    audioScale: farEnd ? FAR_END_AUDIO_SCALE : 1,
+    audioAgeMs: onnxReady ? now - audioUpdatedAt : 0,   // heuristic updates every rAF
+  }, {
+    faceWeight: FACE_WEIGHT, audioWeight: AUDIO_WEIGHT,
+    combinedThreshold: COMBINED_TRIGGER_THRESHOLD, faceSoloThreshold: FACE_SOLO_THRESHOLD,
+    audioSoloThreshold: onnxReady ? AUDIO_SOLO_THRESHOLD_FACE_VISIBLE : Infinity,
+  });
 
   if (DEBUG_LAUGH && Date.now() - lastDebugLogAt > 250) {
     lastDebugLogAt = Date.now();
@@ -725,10 +746,7 @@ function onFaceResults(results) {
     );
   }
 
-  // Either the fused score or a very strong face alone counts; normalise each
-  // by its own threshold so the gate sees 1.0 at whichever fires first.
-  const gateScore = Math.max(blended / COMBINED_TRIGGER_THRESHOLD, faceScore / FACE_SOLO_THRESHOLD);
-  if (laughGate.update(gateScore, Date.now())) triggerLaugh();
+  if (laughGate.update(gateScore, now)) triggerLaugh();
 }
 function startDetectionLoop() {
   if (detectionRunning) return;

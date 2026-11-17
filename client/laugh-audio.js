@@ -373,6 +373,28 @@
     active(nowMs) { return nowMs - this.lastActiveAt <= this.holdMs; }
   }
 
+  // ── Face + audio fusion → gate score ──────────────────────────────────────
+  // Returns a score normalised so 1.0 == "trigger level", for LaughGate.
+  // Three routes, whichever is strongest:
+  //   blended  = face·faceWeight + audio·audioWeight   vs combinedThreshold
+  //   face     alone                                  vs faceSoloThreshold
+  //   audio    alone                                  vs audioSoloThreshold
+  // The audio-alone route matters while a face IS visible: with the weighted
+  // blend only, a confident audible laugh behind a hand (or with a weakly
+  // calibrated face) peaks at audioWeight (0.45) < 0.62 and could never fire,
+  // although the same laugh fires once the face is lost. Audio that is older
+  // than staleMs (pipeline stalled, context suspended) counts as 0, so a stale
+  // high score can't keep feeding the gate. Pass audioSoloThreshold=Infinity
+  // to disable the audio route (e.g. for the speech-prone heuristic).
+  function fusedGateScore({ face, audio, audioAgeMs = 0, audioScale = 1 }, {
+    faceWeight = 0.55, audioWeight = 0.45, combinedThreshold = 0.62,
+    faceSoloThreshold = 0.8, audioSoloThreshold = 0.88, staleMs = 500,
+  } = {}) {
+    const a = audioAgeMs > staleMs ? 0 : Math.max(0, audio) * audioScale;
+    const blended = face * faceWeight + a * audioWeight;
+    return Math.max(blended / combinedThreshold, face / faceSoloThreshold, a / audioSoloThreshold);
+  }
+
   // Root-mean-square of a Float32Array.
   function rmsOf(x) {
     let s = 0;
@@ -412,7 +434,7 @@
   const api = {
     SR, N_FFT, HOP, N_MELS, N_FRAMES, WINDOW_SAMPLES, PEAK_FLOOR_DB,
     hzToMelSlaney, melToHzSlaney, melFilterbank, hannPeriodic, makeFft,
-    LogMelStream, powerToDb, Resampler, ProbSmoother, LaughGate, FarEndGuard, rmsOf, patchOnnxInputShape,
+    LogMelStream, powerToDb, Resampler, ProbSmoother, LaughGate, FarEndGuard, fusedGateScore, rmsOf, patchOnnxInputShape,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.LaughAudio = api;
