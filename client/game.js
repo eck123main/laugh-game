@@ -552,6 +552,7 @@ function updateAudioTrigger() {
   const now = Date.now();
   const threshold = farEndGuard.active(now) ? AUDIO_SOLO_THRESHOLD_FAR_END : AUDIO_SOLO_THRESHOLD;
   if (laughGate.update(_audioLaughConfidence / threshold, now)) triggerLaugh();
+  updateLaughMeter();
 }
 
 // Original heuristic audio loop (unchanged, used as fallback)
@@ -693,12 +694,11 @@ function onFaceResults(results) {
   if (!features) return;
   const { mouth } = features;
 
-  const mouthThresh = faceBaseline.mouth + LaughFace.SCALE.open;
-  const pct = Math.min((mouth / (mouthThresh * 1.2)) * 100, 100);
-  const bar = document.getElementById('mouth-indicator');
-  if (bar) {
-    bar.style.width      = pct + '%';
-    bar.style.background = mouth > mouthThresh ? 'var(--danger)' : 'var(--accent)';
+  // Outside a live round the bar shows mouth opening (useful while
+  // calibrating); during a round updateLaughMeter() shows the trigger gate.
+  if (!laughDetectionActive) {
+    const mouthThresh = faceBaseline.mouth + LaughFace.SCALE.open;
+    setDetectionBar('mouth openness', Math.min(mouth / (mouthThresh * 1.2), 1), mouth > mouthThresh);
   }
 
   if (calibrating) {
@@ -747,6 +747,24 @@ function onFaceResults(results) {
   }
 
   if (laughGate.update(gateScore, now)) triggerLaugh();
+  updateLaughMeter();
+}
+
+// Detection bar under the cams. During a round it shows how close the trigger
+// gate is to firing (what actually decides), not just one facial cue.
+function setDetectionBar(label, frac, hot) {
+  const bar = document.getElementById('mouth-indicator');
+  if (bar) {
+    bar.style.width      = (Math.max(0, Math.min(frac, 1)) * 100) + '%';
+    bar.style.background = hot ? 'var(--danger)' : 'var(--accent)';
+  }
+  const lbl = document.getElementById('detection-label');
+  if (lbl && lbl.textContent !== label) lbl.textContent = label;
+}
+function updateLaughMeter() {
+  if (!laughDetectionActive) return;
+  const p = laughGate.progress();
+  setDetectionBar('crack meter', p, p > 0.6);
 }
 function startDetectionLoop() {
   if (detectionRunning) return;
