@@ -6,9 +6,10 @@
 //
 // Usage:
 //   npm i --no-save onnxruntime-node        # once; not a project dependency
-//   node scripts/eval-audio.js <wav files or dirs...> [--trace] [--no-rhythm]
-// --no-rhythm turns off the BurstRhythm scaling (like ogiggleNoRhythm in the
-// browser); each file also prints its median rhythm regularity.
+//   node scripts/eval-audio.js <wav files or dirs...> [--trace] [--no-rhythm] [--no-voicing]
+// --no-rhythm / --no-voicing turn off the BurstRhythm / VoicingCue scaling
+// (like ogiggleNoRhythm / ogiggleNoVoicing in the browser); each file also
+// prints its median rhythm regularity, unvoiced ratio and f0 (median ± spread).
 //
 // Labels come from the path: a file under a directory named "laugh" or
 // "laughter" should fire, anything else should not. Example layout:
@@ -28,6 +29,7 @@ const DEFAULTS = Object.freeze({
   chunk: 1024, inferEveryFrames: 4, rmsGate: 0.008, smoothAlpha: 0.5,
   soloThreshold: 0.75, gateOff: 0.85, sustainMs: 850, decayRate: 0.5,
   rhythm: true,   // BurstRhythm scaling (pass --no-rhythm to compare)
+  voicing: true,  // VoicingCue scaling (pass --no-voicing to compare)
 });
 
 // Minimal RIFF/WAVE reader → { sampleRate, samples: Float32Array (mono) }.
@@ -73,6 +75,7 @@ async function simulate(samples, sampleRate, infer, opts = {}) {
   const stream = new LA.LogMelStream();
   const smoother = new LA.ProbSmoother(o.smoothAlpha);
   const rhythm = new LA.BurstRhythm();
+  const voicing = new LA.VoicingCue();
   const trace = [];
   let frames = 0, raw = 0;
   for (let i = 0; i < samples.length; i += o.chunk) {
@@ -80,17 +83,19 @@ async function simulate(samples, sampleRate, infer, opts = {}) {
     const s8k = resampler.process(chunk);
     frames += stream.push(s8k);
     rhythm.push(s8k);
+    voicing.push(s8k);
     if (frames < o.inferEveryFrames || !stream.ready()) continue;
     frames = 0;
     const t = ((i + chunk.length) / sampleRate) * 1000;
-    let p, r = null;
+    let p, r = null, v = null;
     if (stream.peakRms() < o.rmsGate) p = smoother.decay();
     else {
       raw = Math.min(Math.max(await infer(stream.getWindow()), 0), 1);
       r = rhythm.regularity();
-      p = smoother.update(raw * (o.rhythm ? rhythm.scale() : 1));
+      v = voicing.stats();
+      p = smoother.update(raw * (o.rhythm ? rhythm.scale() : 1) * (o.voicing ? voicing.scale() : 1));
     }
-    trace.push({ t, p, r });
+    trace.push({ t, p, r, v });
   }
   return { trace, firedAt: gateOnTrace(trace, o.soloThreshold, o) };
 }
@@ -138,7 +143,7 @@ async function main(argv) {
   const files = collectWavs(argv.filter((a) => !a.startsWith('--')));
   if (!files.length) { console.error('usage: node scripts/eval-audio.js <wav files or dirs...> [--trace]'); process.exit(2); }
   const infer = await loadModel();
-  const opts = { rhythm: !argv.includes('--no-rhythm') };
+  const opts = { rhythm: !argv.includes('--no-rhythm'), voicing: !argv.includes('--no-voicing') };
   const results = [];
   for (const f of files) {
     const { sampleRate, samples } = parseWav(fs.readFileSync(f));
@@ -149,7 +154,13 @@ async function main(argv) {
     const ok = (firedAt !== null) === laugh ? 'ok  ' : 'MISS';
     const rs = trace.filter((x) => x.r !== null).map((x) => x.r).sort((a, b) => a - b);
     const rMed = rs.length ? rs[rs.length >> 1].toFixed(2) : '-';
-    console.log(`${ok} ${laugh ? 'laugh' : 'other'}  fired=${firedAt === null ? '-' : (firedAt / 1000).toFixed(2) + 's'}  peak=${peak.toFixed(2)}  rhythm(median)=${rMed}  ${f}`);
+    const med = (k) => {
+      const a = trace.filter((x) => x.v).map((x) => x.v[k]).sort((x, y) => x - y);
+      return a.length ? a[a.length >> 1] : null;
+    };
+    const uv = med('unvoicedRatio');
+    const vStr = uv === null ? '-' : `${uv.toFixed(2)} f0=${med('f0Median').toFixed(0)}Hz±${med('f0SpreadSt').toFixed(1)}st`;
+    console.log(`${ok} ${laugh ? 'laugh' : 'other'}  fired=${firedAt === null ? '-' : (firedAt / 1000).toFixed(2) + 's'}  peak=${peak.toFixed(2)}  rhythm(median)=${rMed}  unvoiced(median)=${vStr}  ${f}`);
     if (showTrace) console.log('     ' + trace.map((x) => x.p.toFixed(2)).join(' '));
   }
   console.log('\nthreshold  recall(laugh fired)  false-fire(other fired)');

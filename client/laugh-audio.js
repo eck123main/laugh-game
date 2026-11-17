@@ -465,6 +465,112 @@
     }
   }
 
+  // ── Voicing cue (voiced/unvoiced alternation + pitch) ─────────────────────
+  // Laughter alternates voiced vowels with breathy, unvoiced "h" aspiration
+  // (and many laughs are unvoiced grunts/snorts altogether), so its
+  // unvoiced-to-voiced duration ratio is higher than speech's (Truong & van
+  // Leeuwen 2007; Bickley & Hunnicutt 1992; Petridis & Pantic 2008 use the
+  // "unvoiced ratio" as a key prosodic feature). Sounds that stay voiced the
+  // whole time (humming, singing, held vowels, music, mains hum) are not
+  // laughter. Per 10 ms block, a 40 ms frame is tested for periodicity with a
+  // normalised autocorrelation over 75–615 Hz (voiced if the peak ≥
+  // voicedR, like Praat's voicing threshold). stats() summarises the last
+  // 1.5 s over "active" blocks (within activeDb of the loudest block), so
+  // silent gaps between calls don't count either way. scale() maps the
+  // unvoiced ratio to a model-probability multiplier: minScale when nothing
+  // is unvoiced, 1 once the ratio ≥ full. f0 median/spread (semitones) are
+  // reported for diagnostics; laughter's pitch is higher and more variable
+  // than speech (Bachorowski et al. 2001; Szameitat et al. 2009) but needs a
+  // per-speaker baseline before it can be used as a cue.
+  class VoicingCue {
+    constructor({ blockSamples = 80, frameSamples = 320, nBlocks = 150,
+      minLag = 13, maxLag = 107, voicedR = 0.5, activeDb = 25, minActive = 20,
+      minScale = 0.9, full = 0.2 } = {}) {
+      Object.assign(this, { blockSamples, frameSamples, nBlocks, minLag, maxLag,
+        voicedR, activeDb, minActive, minScale, full });
+      this.ring = new Float32Array(frameSamples);
+      this.frame = new Float64Array(frameSamples);
+      this.db = new Float32Array(nBlocks);
+      this.f0 = new Float32Array(nBlocks);       // 0 = unvoiced
+      this.reset();
+    }
+    reset() {
+      this.ring.fill(0); this.db.fill(-100); this.f0.fill(0);
+      this.pos = 0; this.total = 0; this.count = 0; this.acc = 0; this.accN = 0;
+    }
+    push(samples) {
+      for (let i = 0; i < samples.length; i++) {
+        const s = samples[i];
+        this.ring[this.pos] = s; this.pos = (this.pos + 1) % this.frameSamples;
+        this.total++;
+        this.acc += s * s;
+        if (++this.accN === this.blockSamples) {
+          const slot = this.count % this.nBlocks;
+          this.db[slot] = 10 * Math.log10(this.acc / this.blockSamples + 1e-10);
+          this.f0[slot] = this.total >= this.frameSamples ? this._pitch() : 0;
+          this.count++; this.acc = 0; this.accN = 0;
+        }
+      }
+    }
+    // f0 in Hz of the latest frame, or 0 if unvoiced.
+    _pitch() {
+      const n = this.frameSamples, x = this.frame;
+      let mean = 0;
+      for (let i = 0; i < n; i++) { x[i] = this.ring[(this.pos + i) % n]; mean += x[i]; }
+      mean /= n;
+      let e = 0;
+      for (let i = 0; i < n; i++) { x[i] -= mean; e += x[i] * x[i]; }
+      if (e < 1e-9) return 0;
+      const r = this._r || (this._r = new Float64Array(this.maxLag + 1));
+      let best = 0;
+      for (let L = this.minLag; L <= this.maxLag; L++) {
+        let xy = 0, xx = 0, yy = 0;
+        for (let i = 0; i + L < n; i++) { const a = x[i], b = x[i + L]; xy += a * b; xx += a * a; yy += b * b; }
+        r[L] = xy / Math.sqrt(xx * yy + 1e-12);
+        if (r[L] > best) best = r[L];
+      }
+      if (best < this.voicedR) return 0;
+      // Octave-error guard: take the shortest-lag local peak that is nearly as
+      // strong as the best one (a 200 Hz voice also correlates at 100 Hz).
+      for (let L = this.minLag; L <= this.maxLag; L++) {
+        const prev = L > this.minLag ? r[L - 1] : -Infinity, next = L < this.maxLag ? r[L + 1] : -Infinity;
+        if (r[L] >= 0.9 * best && r[L] >= prev && r[L] >= next) return SR / L;
+      }
+      return 0;
+    }
+    // { active, unvoicedRatio, f0Median, f0SpreadSt } or null when there is
+    // too little sound in the last 1.5 s to judge.
+    stats() {
+      const n = Math.min(this.count, this.nBlocks);
+      if (!n) return null;
+      let mx = -Infinity;
+      for (let i = 0; i < n; i++) if (this.db[i] > mx) mx = this.db[i];
+      const floor = mx - this.activeDb;
+      let active = 0, unvoiced = 0;
+      const f0s = [];
+      for (let i = 0; i < n; i++) {
+        if (this.db[i] < floor) continue;
+        active++;
+        if (this.f0[i] > 0) f0s.push(this.f0[i]); else unvoiced++;
+      }
+      if (active < this.minActive) return null;
+      let f0Median = 0, f0SpreadSt = 0;
+      if (f0s.length) {
+        f0s.sort((a, b) => a - b);
+        f0Median = f0s[f0s.length >> 1];
+        let s = 0, s2 = 0;
+        for (const f of f0s) { const st = 12 * Math.log2(f / f0Median); s += st; s2 += st * st; }
+        f0SpreadSt = Math.sqrt(Math.max(0, s2 / f0s.length - (s / f0s.length) ** 2));
+      }
+      return { active, unvoicedRatio: unvoiced / active, f0Median, f0SpreadSt };
+    }
+    scale() {
+      const st = this.stats();
+      if (!st || st.unvoicedRatio >= this.full) return 1;
+      return this.minScale + (1 - this.minScale) * (st.unvoicedRatio / this.full);
+    }
+  }
+
   // Root-mean-square of a Float32Array.
   function rmsOf(x) {
     let s = 0;
@@ -504,7 +610,7 @@
   const api = {
     SR, N_FFT, HOP, N_MELS, N_FRAMES, WINDOW_SAMPLES, PEAK_FLOOR_DB,
     hzToMelSlaney, melToHzSlaney, melFilterbank, hannPeriodic, makeFft,
-    LogMelStream, powerToDb, Resampler, ProbSmoother, LaughGate, FarEndGuard, BurstRhythm, fusedGateScore, rmsOf, patchOnnxInputShape,
+    LogMelStream, powerToDb, Resampler, ProbSmoother, LaughGate, FarEndGuard, BurstRhythm, VoicingCue, fusedGateScore, rmsOf, patchOnnxInputShape,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.LaughAudio = api;

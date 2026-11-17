@@ -46,11 +46,22 @@ test('simulate: a confident 3 s "laugh" fires the audio-alone gate; silence neve
 
 test('simulate: a borderline score on a steady (rhythm-less) sound is pushed below threshold by BurstRhythm', async () => {
   const sr = 8000;
-  const off = await EV.simulate(tone(3, sr), sr, () => 0.8, { rhythm: false });
+  const off = await EV.simulate(tone(3, sr), sr, () => 0.8, { rhythm: false, voicing: false });
   assert.ok(off.firedAt !== null, 'fires without the rhythm cue');
-  const on = await EV.simulate(tone(3, sr), sr, () => 0.8, { rhythm: true });
+  const on = await EV.simulate(tone(3, sr), sr, () => 0.8, { rhythm: true, voicing: false });
   assert.equal(on.firedAt, null, '0.8 × 0.9 < 0.75 for a flat tone');
   assert.ok(on.trace.some((x) => x.r === 0));
+});
+
+test('simulate: a borderline score on a continuously voiced sound is pushed below threshold by VoicingCue', async () => {
+  const sr = 8000;
+  const hum = tone(3, sr, 0.3, 220);
+  const off = await EV.simulate(hum, sr, () => 0.8, { rhythm: false, voicing: false });
+  assert.ok(off.firedAt !== null, 'fires without the voicing cue');
+  const on = await EV.simulate(hum, sr, () => 0.8, { rhythm: false, voicing: true });
+  assert.equal(on.firedAt, null, '0.8 × 0.9 < 0.75 for a steady hum');
+  const v = on.trace.filter((x) => x.v).at(-1).v;
+  assert.ok(v.unvoicedRatio < 0.05 && Math.abs(v.f0Median - 220) < 10, JSON.stringify(v));
 });
 
 test('simulate: inference cadence is ~93 ms like the browser', async () => {

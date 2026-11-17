@@ -107,6 +107,13 @@ let probSmoother   = null;   // LaughAudio.ProbSmoother
 const RHYTHM_ENABLED = (() => { try { return !localStorage.getItem('ogiggleNoRhythm'); } catch (_) { return true; } })();
 let burstRhythm    = null;   // LaughAudio.BurstRhythm
 let lastRhythmScale = 1;     // last applied rhythm multiplier (debug log)
+// Voicing cue: laughter alternates voiced vowels with unvoiced "h" breaths;
+// humming, singing, held vowels and music stay voiced. Scales the model
+// probability by 0.9–1 (see VoicingCue).
+// localStorage.ogiggleNoVoicing = 1 disables it for A/B testing.
+const VOICING_ENABLED = (() => { try { return !localStorage.getItem('ogiggleNoVoicing'); } catch (_) { return true; } })();
+let voicingCue     = null;   // LaughAudio.VoicingCue
+let lastVoicingScale = 1;    // last applied voicing multiplier (debug log)
 let inferenceBusy  = false;  // never overlap session.run() calls
 let framesSinceInference = 0;
 let lastFaceSeenAt = 0;      // ms timestamp of the last frame with a face
@@ -178,6 +185,7 @@ async function loadOnnxModel() {
     laughStream   = new LaughAudio.LogMelStream();
     probSmoother  = new LaughAudio.ProbSmoother(0.5);
     burstRhythm   = new LaughAudio.BurstRhythm();
+    voicingCue    = new LaughAudio.VoicingCue();
     console.log('ResNet laughter model loaded ✓ (layout:', onnxTimeMajor ? 'time×mel' : 'mel×time', ')');
     return true;
   } catch (e) {
@@ -486,6 +494,7 @@ async function initAudioDetection() {
       laughStream.reset();
       probSmoother.reset();
       burstRhythm.reset();
+      voicingCue.reset();
       framesSinceInference = 0;
 
       const onMicSamples = (chunk) => {
@@ -493,6 +502,7 @@ async function initAudioDetection() {
         const samples = audioResampler.process(chunk);
         framesSinceInference += laughStream.push(samples);
         burstRhythm.push(samples);
+        voicingCue.push(samples);
 
         if (framesSinceInference < INFER_EVERY_FRAMES || inferenceBusy) return;
         framesSinceInference = 0;
@@ -517,7 +527,9 @@ async function initAudioDetection() {
           if (prob === null || !laughDetectionActive) return;
           const rhythm = RHYTHM_ENABLED ? burstRhythm.scale() : 1;
           lastRhythmScale = rhythm;
-          _audioLaughConfidence = probSmoother.update(prob * rhythm);
+          const voicing = VOICING_ENABLED ? voicingCue.scale() : 1;
+          lastVoicingScale = voicing;
+          _audioLaughConfidence = probSmoother.update(prob * rhythm * voicing);
           audioUpdatedAt = Date.now();
           updateAudioTrigger();
         });
@@ -762,6 +774,7 @@ function onFaceResults(results) {
       'face:', faceScore.toFixed(2),
       '| audio:', _audioLaughConfidence.toFixed(2),
       '| rhythm:', lastRhythmScale.toFixed(2),
+      '| voicing:', lastVoicingScale.toFixed(2),
       '| blended:', blended.toFixed(2),
       '| open:', face.open.toFixed(2),
       '| smile:', face.smile.toFixed(2) + '/' + face.rawSmile.toFixed(2),
@@ -1216,6 +1229,7 @@ function cleanup() {
   if (laughStream)  laughStream.reset();
   if (probSmoother) probSmoother.reset();
   if (burstRhythm)  burstRhythm.reset();
+  if (voicingCue)   voicingCue.reset();
 
   if (micCaptureNode) {
     try {
