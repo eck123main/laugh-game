@@ -76,10 +76,11 @@ const laughGate = new LaughAudio.LaughGate({
   on: 1, off: GATE_OFF_RATIO, sustainMs: LAUGH_SUSTAIN_MS, decayRate: 0.5,
 });
 
-let baselineMouth  = 0.025;
-let baselineCheek  = 0;
-let baselineEye    = 0;
+let faceBaseline   = { ...LaughFace.DEFAULT_BASELINE };   // see laugh-face.js
 let calibrating    = false;
+// Set `localStorage.ogiggleDebug = 1` to log detector scores to the console.
+const DEBUG_LAUGH  = (() => { try { return !!localStorage.getItem('ogiggleDebug'); } catch (_) { return false; } })();
+let lastDebugLogAt = 0;
 let calibrationSamples = [];
 
 let detectionCanvas, detectionCtx;
@@ -583,32 +584,7 @@ function runHeuristicAudioLoop(analyser) {
 }
 
 // ─── Face Detection ───────────────────────────────────────
-const LM_UPPER_LIP    = 13;
-const LM_LOWER_LIP    = 14;
-const LM_LEFT_CORNER  = 78;
-const LM_RIGHT_CORNER = 308;
-const LM_LEFT_CHEEK   = 50;
-const LM_RIGHT_CHEEK  = 280;
-const LM_LEFT_EYE_TOP = 159;
-const LM_LEFT_EYE_BOT = 145;
-const LM_RIGHT_EYE_TOP= 386;
-const LM_RIGHT_EYE_BOT= 374;
-
-function getFaceFeatures(lm) {
-  const mouthH = Math.abs(lm[LM_LOWER_LIP].y - lm[LM_UPPER_LIP].y);
-  const mouthW = Math.abs(lm[LM_RIGHT_CORNER].x - lm[LM_LEFT_CORNER].x);
-  const mouth  = mouthW > 0.001 ? mouthH / mouthW : 0;
-
-  const cornerMidY = (lm[LM_LEFT_CORNER].y + lm[LM_RIGHT_CORNER].y) / 2;
-  const cheekMidY  = (lm[LM_LEFT_CHEEK].y  + lm[LM_RIGHT_CHEEK].y)  / 2;
-  const cheek      = cornerMidY - cheekMidY;
-
-  const leftEyeH  = Math.abs(lm[LM_LEFT_EYE_TOP].y  - lm[LM_LEFT_EYE_BOT].y);
-  const rightEyeH = Math.abs(lm[LM_RIGHT_EYE_TOP].y - lm[LM_RIGHT_EYE_BOT].y);
-  const eyeApert  = (leftEyeH + rightEyeH) / 2;
-
-  return { mouth, cheek, eyeApert };
-}
+// Landmark features + laughter scoring live in laugh-face.js (LaughFace).
 
 function initFaceDetection() {
   detectionCanvas        = document.createElement('canvas');
@@ -642,9 +618,11 @@ function onFaceResults(results) {
   if (!results.multiFaceLandmarks || !results.multiFaceLandmarks.length) return;
   lastFaceSeenAt = Date.now();
   const lm = results.multiFaceLandmarks[0];
-  const { mouth, cheek, eyeApert } = getFaceFeatures(lm);
+  const features = LaughFace.getFaceFeatures(lm, detectionCanvas.width / detectionCanvas.height);
+  if (!features) return;
+  const { mouth } = features;
 
-  const mouthThresh = baselineMouth + 0.22;
+  const mouthThresh = faceBaseline.mouth + LaughFace.SCALE.open;
   const pct = Math.min((mouth / (mouthThresh * 1.2)) * 100, 100);
   const bar = document.getElementById('mouth-indicator');
   if (bar) {
@@ -653,36 +631,31 @@ function onFaceResults(results) {
   }
 
   if (calibrating) {
-    calibrationSamples.push({ mouth, cheek, eyeApert });
+    calibrationSamples.push(features);
     if (calibrationSamples.length >= CALIBRATION_FRAMES) finishCalibration();
     return;
   }
 
   if (!laughDetectionActive || laughTriggered) return;
 
-  const mouthDelta = mouth - baselineMouth;
-  const mouthScore = Math.min(Math.max(mouthDelta / 0.22, 0), 1);
-  const cheekDelta = cheek - baselineCheek;
-  const cheekScore = Math.min(Math.max(cheekDelta / 0.10, 0), 1);
+  // Mouth opening alone (talking, yawning) caps at 0.45 — below the face-only
+  // threshold — so a face-only trigger needs smile/eye cues too.
+  const face      = LaughFace.scoreFace(features, faceBaseline);
+  const faceScore = face.score;
+  const blended   = (faceScore * FACE_WEIGHT) + (_audioLaughConfidence * AUDIO_WEIGHT);
 
-  const eyeDelta   = baselineEye - eyeApert;
-  const eyeScore   = Math.min(Math.max(eyeDelta / 0.015, 0), 1);
-  const faceScore = Math.min((mouthScore * 0.80) + (cheekScore * 0.10) + (eyeScore * 0.10), 1);
-
-  const blended    = (faceScore * FACE_WEIGHT) + (_audioLaughConfidence * AUDIO_WEIGHT);
-
-  // ── ADD THIS ──
-  if (Math.random() < 0.05) { // log ~5% of frames to avoid spam
+  if (DEBUG_LAUGH && Date.now() - lastDebugLogAt > 250) {
+    lastDebugLogAt = Date.now();
     console.log(
       'face:', faceScore.toFixed(2),
       '| audio:', _audioLaughConfidence.toFixed(2),
       '| blended:', blended.toFixed(2),
-      '| mouth:', mouthScore.toFixed(2),
-      '| cheek:', cheekScore.toFixed(2),
-      '| eye:', eyeScore.toFixed(2)
+      '| open:', face.open.toFixed(2),
+      '| smile:', face.smile.toFixed(2),
+      '| eye:', face.eye.toFixed(2),
+      '| gate:', laughGate.progress().toFixed(2)
     );
   }
-  // ─────────────
 
   // Either the fused score or a very strong face alone counts; normalise each
   // by its own threshold so the gate sees 1.0 at whichever fires first.
@@ -706,23 +679,12 @@ function startDetectionLoop() {
 
 function finishCalibration() {
   calibrating = false;
-  const n = calibrationSamples.length;
-  if (n === 0) return;
-
-  const trimmed = (arr) => {
-    const sorted = [...arr].sort((a, b) => a - b);
-    const lo    = Math.floor(n * 0.2);
-    const hi    = Math.ceil(n * 0.8);
-    const slice = sorted.slice(lo, hi);
-    return slice.reduce((a, b) => a + b, 0) / slice.length;
-  };
-
-  baselineMouth = trimmed(calibrationSamples.map(s => s.mouth));
-  baselineCheek = trimmed(calibrationSamples.map(s => s.cheek));
-  baselineEye   = trimmed(calibrationSamples.map(s => s.eyeApert));
-  console.log('Calibrated — mouth:', baselineMouth.toFixed(4),
-              'cheek:', baselineCheek.toFixed(4),
-              'eye:', baselineEye.toFixed(4));
+  if (calibrationSamples.length === 0) return;
+  faceBaseline = LaughFace.calibrate(calibrationSamples);
+  console.log('Calibrated — mouth:', faceBaseline.mouth.toFixed(4),
+              'width:', faceBaseline.width.toFixed(4),
+              'lift:', faceBaseline.lift.toFixed(4),
+              'eye:', faceBaseline.eye.toFixed(4));
 }
 
 function triggerLaugh() {
