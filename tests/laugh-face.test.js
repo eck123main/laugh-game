@@ -124,3 +124,11 @@ test('laughing through calibration does not disable the mouth cue', () => {
   assert.ok(b.mouth <= 0.08, `mouth baseline clamped, got ${b.mouth}`);
   assert.ok(LF.scoreFace(feats({ open: 0.2 }), b).open > 0.5);
 });
+
+test('a short calibration (MIN_CALIBRATION_FRAMES) still yields a full baseline', () => {
+  const n = LF.MIN_CALIBRATION_FRAMES;
+  assert.ok(n > 0 && n < 90);
+  const base = LF.calibrate(Array.from({ length: n }, () => feats({})));
+  for (const k of ['mouth', 'width', 'lift', 'eye']) assert.ok(Number.isFinite(base[k]), k);
+  assert.ok(LF.scoreFace(feats({ open: 0.06, widen: 1.2, eye: 0.7 }), base).score > 0.8);
+});

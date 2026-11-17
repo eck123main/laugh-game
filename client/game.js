@@ -745,9 +745,18 @@ function startDetectionLoop() {
   requestAnimationFrame(loop);
 }
 
+// Called when CALIBRATION_FRAMES have been collected, or when the round starts.
+// The countdown lasts ~3.6 s, so below ~25 fps (common for FaceMesh on
+// laptops, and in round 1 while the model is still loading) the 90-frame
+// target is never reached; previously those samples were silently dropped
+// and the round ran on the default baseline (no width/eye cues at all).
+// Too few frames → keep the previous baseline rather than trust noise.
 function finishCalibration() {
   calibrating = false;
-  if (calibrationSamples.length === 0) return;
+  if (calibrationSamples.length < LaughFace.MIN_CALIBRATION_FRAMES) {
+    console.warn('Calibration: only', calibrationSamples.length, 'face frames — keeping previous baseline');
+    return;
+  }
   faceBaseline = LaughFace.calibrate(calibrationSamples);
   console.log('Calibrated — mouth:', faceBaseline.mouth.toFixed(4),
               'width:', faceBaseline.width.toFixed(4),
@@ -1018,7 +1027,7 @@ function goRound() {
   laughDetectionActive = iAmActive;
   laughTriggered       = !iAmActive;
   laughGate.reset();
-  calibrating          = false;
+  if (calibrating) finishCalibration();
 
   if (!faceMesh && iAmActive) document.getElementById('laugh-btn').disabled = false;
   startTimer();

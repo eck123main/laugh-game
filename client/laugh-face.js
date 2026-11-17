@@ -72,6 +72,10 @@
   // A relaxed closed/slightly-parted mouth has height/width ≲ 0.05.
   const MAX_BASELINE_MOUTH = 0.08;
 
+  // Fewest frames a calibration may be finalised from (≈0.5–1 s of video).
+  // With a trimmed mean, 15 frames is already robust to a few bad ones.
+  const MIN_CALIBRATION_FRAMES = 15;
+
   // Robust baseline: 20–80 % trimmed mean of each feature over the samples.
   function calibrate(samples) {
     const valid = samples.filter(Boolean);
@@ -101,7 +105,7 @@
     return { score, open, smile, eye };
   }
 
-  const api = { LM, SCALE, WEIGHTS, DEFAULT_BASELINE, getFaceFeatures, calibrate, scoreFace };
+  const api = { LM, SCALE, WEIGHTS, DEFAULT_BASELINE, MIN_CALIBRATION_FRAMES, getFaceFeatures, calibrate, scoreFace };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.LaughFace = api;
 })(typeof window !== 'undefined' ? window : globalThis);
