@@ -346,10 +346,21 @@ async function startCamera() {
   try {
     // Echo cancellation keeps the opponents' laughter (played through our
     // speakers) from being picked up by our mic and counted as *our* laugh.
+    // Speech-tuned noise suppression and AGC may weaken or compress laughter.
+    // For A/B testing, set localStorage.ogiggleRawMic = 1 to turn both off
+    // (echo cancellation stays on). The applied settings are logged, because
+    // browsers may ignore the request.
+    const rawMic = (() => { try { return !!localStorage.getItem('ogiggleRawMic'); } catch (_) { return false; } })();
     localStream = await navigator.mediaDevices.getUserMedia({
       video: true,
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      audio: { echoCancellation: true, noiseSuppression: !rawMic, autoGainControl: !rawMic },
     });
+    const at = localStream.getAudioTracks()[0];
+    if (at && (rawMic || DEBUG_LAUGH) && at.getSettings) {
+      const s = at.getSettings();
+      console.log('Mic settings — echoCancellation:', s.echoCancellation,
+                  'noiseSuppression:', s.noiseSuppression, 'autoGainControl:', s.autoGainControl);
+    }
     const vid = document.getElementById('video-' + me());
     if (vid) { vid.srcObject = localStream; vid.muted = true; hideOverlay('overlay-' + me()); }
   } catch (e) { console.warn('Camera unavailable:', e); }
