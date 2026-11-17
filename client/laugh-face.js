@@ -105,7 +105,51 @@
     return { score, open, smile, eye };
   }
 
-  const api = { LM, SCALE, WEIGHTS, DEFAULT_BASELINE, MIN_CALIBRATION_FRAMES, getFaceFeatures, calibrate, scoreFace };
+  // Temporal persistence for the smile (AU12) and eye (AU6) cues.
+  // A laughing smile and cheek raise are held for a second or more. Speech
+  // and blinks only touch these cues briefly:
+  //   - spread vowels ("ee", "eh") widen the mouth for ~100–200 ms
+  //   - a blink closes the eye (looks like a full squint) for ~100–150 ms
+  // Each spike adds evidence to the leaky LaughGate at full rate and leaks
+  // at half rate, so steady talking or blinking could slowly fill it.
+  // Taking a low quantile of each cue over a short window drops spikes
+  // shorter than ~(1 − quantile) of the window. A sustained smile passes
+  // with ~quantile·window delay (~90 ms at the defaults, more on onset).
+  // Mouth opening is left instantaneous: it is already capped at
+  // WEIGHTS.open, and "ha-ha" opening oscillates in real laughs too.
+  class CuePersistence {
+    constructor({ windowMs = 350, quantile = 0.25 } = {}) {
+      if (!(windowMs > 0) || !(quantile >= 0 && quantile <= 1)) throw new RangeError('bad CuePersistence options');
+      this.windowMs = windowMs;
+      this.quantile = quantile;
+      this.reset();
+    }
+    reset() { this._t = []; this._smile = []; this._eye = []; }
+    _q(arr) {
+      const s = arr.slice().sort((a, b) => a - b);
+      return s[Math.floor(this.quantile * (s.length - 1))];
+    }
+    // cues: output of scoreFace(). Returns the same shape with smile/eye
+    // replaced by their persistent values and score recomputed.
+    update(cues, now) {
+      // Drop samples outside the window (and all of them after a time jump
+      // backwards or a long face-lost gap).
+      while (this._t.length && (now - this._t[0] > this.windowMs || now < this._t[this._t.length - 1])) {
+        this._t.shift(); this._smile.shift(); this._eye.shift();
+      }
+      this._t.push(now); this._smile.push(cues.smile); this._eye.push(cues.eye);
+      // Until the history covers enough of the window (after a reset or a
+      // face-lost gap), a spike on the first frames would be all there is,
+      // so report no smile/eye yet; a real smile waits ~the same onset delay.
+      const filled = now - this._t[0] >= this.windowMs * (1 - this.quantile);
+      const smile = filled ? this._q(this._smile) : 0;
+      const eye   = filled ? this._q(this._eye) : 0;
+      const score = WEIGHTS.open * cues.open + WEIGHTS.smile * smile + WEIGHTS.eye * eye;
+      return { score, open: cues.open, smile, eye, rawSmile: cues.smile, rawEye: cues.eye };
+    }
+  }
+
+  const api = { LM, SCALE, WEIGHTS, DEFAULT_BASELINE, MIN_CALIBRATION_FRAMES, getFaceFeatures, calibrate, scoreFace, CuePersistence };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.LaughFace = api;
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -77,6 +77,8 @@ const laughGate = new LaughAudio.LaughGate({
 });
 
 let faceBaseline   = { ...LaughFace.DEFAULT_BASELINE };   // see laugh-face.js
+// Drops smile/squint spikes from spread vowels and blinks (see laugh-face.js).
+const facePersistence = new LaughFace.CuePersistence();
 let calibrating    = false;
 // Set `localStorage.ogiggleDebug = 1` to log detector scores to the console.
 const DEBUG_LAUGH  = (() => { try { return !!localStorage.getItem('ogiggleDebug'); } catch (_) { return false; } })();
@@ -711,9 +713,9 @@ function onFaceResults(results) {
 
   // Mouth opening alone (talking, yawning) caps at 0.45 — below the face-only
   // threshold — so a face-only trigger needs smile/eye cues too.
-  const face      = LaughFace.scoreFace(features, faceBaseline);
-  const faceScore = face.score;
   const now       = Date.now();
+  const face      = facePersistence.update(LaughFace.scoreFace(features, faceBaseline), now);
+  const faceScore = face.score;
   const farEnd    = farEndGuard.active(now);
   const audioConf = _audioLaughConfidence * (farEnd ? FAR_END_AUDIO_SCALE : 1);
   const blended   = (faceScore * FACE_WEIGHT) + (audioConf * AUDIO_WEIGHT);
@@ -739,8 +741,8 @@ function onFaceResults(results) {
       '| audio:', _audioLaughConfidence.toFixed(2),
       '| blended:', blended.toFixed(2),
       '| open:', face.open.toFixed(2),
-      '| smile:', face.smile.toFixed(2),
-      '| eye:', face.eye.toFixed(2),
+      '| smile:', face.smile.toFixed(2) + '/' + face.rawSmile.toFixed(2),
+      '| eye:', face.eye.toFixed(2) + '/' + face.rawEye.toFixed(2),
       '| gate:', laughGate.progress().toFixed(2),
       '| farEnd:', farEnd ? farEndGuard.level.toFixed(3) : 'off'
     );
@@ -1063,6 +1065,7 @@ function goRound() {
   laughDetectionActive = iAmActive;
   laughTriggered       = !iAmActive;
   laughGate.reset();
+  facePersistence.reset();
   if (calibrating) finishCalibration();
 
   if (!faceMesh && iAmActive) document.getElementById('laugh-btn').disabled = false;
